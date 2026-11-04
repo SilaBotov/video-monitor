@@ -1,5 +1,5 @@
 requests
-duckduckgo-search
+ddgs
 beautifulsoup4
 openai
 feedparser
