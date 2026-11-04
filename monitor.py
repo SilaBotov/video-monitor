@@ -2,13 +2,14 @@
 """
 Мониторинг бесплатных веб-генераторов видео -> Telegram.
 Версия с Groq API (бесплатно, без карты, работает в РФ).
-Поиск: DuckDuckGo + парсинг страниц -> анализ через Groq (Llama 3.3 70B).
+Поиск: Google News RSS + DuckDuckGo News/Web + парсинг страниц -> анализ через Groq.
 """
 import json
 import os
 import re
 import html
 import time
+import feedparser
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -84,10 +85,8 @@ def extract_page_text(url: str, max_chars: int = 3000) -> str:
         r = requests.get(url, headers=headers, timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        # Удаляем мусор
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe"]):
             tag.decompose()
-        # Берём текст из основных элементов
         texts = []
         for tag in soup.find_all(["h1", "h2", "h3", "h4", "p", "li"]):
             t = tag.get_text(strip=True)
@@ -100,48 +99,105 @@ def extract_page_text(url: str, max_chars: int = 3000) -> str:
 
 
 def search_and_parse() -> list[dict]:
-    """Ищет в DuckDuckGo и парсит страницы результатов."""
-    queries = [
-        # Основные запросы — новые бесплатные сервисы
-        f'new free AI video generator browser "no credit card" 2024..{datetime.now().year}',
-        f'бесплатный ИИ генератор видео браузер "без карты" {datetime.now().year}',
-        f'AI video generator free trial browser based 2024..{datetime.now().year}',
-        
-        # NotebookLM — отдельная группа запросов
-        f'Google NotebookLM update video generation 2024..{datetime.now().year}',
-        f'NotebookLM new features video audio overview {datetime.now().year}',
-        f'Google NotebookLM обновление видео генерация {datetime.now().year}',
-        
-        # Доступность в России
-        f'AI video generator available Russia works in Russia 2024..{datetime.now().year}',
-        f'ИИ генератор видео работает в России без VPN 2024..{datetime.now().year}',
-        f'AI video service Russia VPN access free 2024..{datetime.now().year}',
-    ]
-
-    seen_urls = set()
+    """Ищет в Google News RSS, DuckDuckGo News и Web, парсит страницы результатов."""
+    year = datetime.now().year
     results = []
+    seen_urls = set()
 
-    for q in queries:
+    # 1. Google News RSS (Самые свежие пресс-релизы и новости, обновляется в реальном времени)
+    news_queries = [
+        "AI video generator free browser",
+        "Google NotebookLM update video",
+        "AI video generator Russia available",
+        "Adobe Firefly Video free",
+        "EaseMate AI video",
+    ]
+    for q in news_queries:
+        try:
+            url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=ru&gl=RU&ceid=RU:ru"
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:5]:  # Берем топ-5 по каждому запросу
+                link = entry.get("link", "")
+                if not link or link in seen_urls:
+                    continue
+                seen_urls.add(link)
+                results.append({
+                    "title": entry.get("title", ""),
+                    "snippet": entry.get("summary", ""),
+                    "url": link,
+                    "source": "google_news",
+                })
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Ошибка Google News RSS '{q}': {e}")
+
+    # 2. DuckDuckGo News (Новостные статьи из СМИ и блогов)
+    ddg_news_queries = [
+        f"new free AI video generator browser no credit card {year}",
+        f"Google NotebookLM video generation update {year}",
+        f"AI video generator available Russia VPN {year}",
+    ]
+    for q in ddg_news_queries:
         try:
             with DDGS() as ddgs:
-                hits = list(ddgs.text(q, max_results=8))
+                hits = list(ddgs.news(q, max_results=5))
+            for h in hits:
+                url = h.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                results.append({
+                    "title": h.get("title", ""),
+                    "snippet": h.get("body", ""),
+                    "url": url,
+                    "source": "ddg_news",
+                })
+            time.sleep(1)
+        except Exception as e:
+            print(f"Ошибка DuckDuckGo News '{q}': {e}")
+
+    # 3. DuckDuckGo Web (Обычный поиск для полноты картины: форумы, обзоры)
+    ddg_web_queries = [
+        f'free AI video generator browser "no credit card" {year}',
+        f'бесплатный ИИ генератор видео браузер "без карты" {year}',
+        f'NotebookLM new features video {year}',
+    ]
+    for q in ddg_web_queries:
+        try:
+            with DDGS() as ddgs:
+                hits = list(ddgs.text(q, max_results=5))
             for h in hits:
                 url = h.get("href", "")
                 if not url or url in seen_urls:
                     continue
                 seen_urls.add(url)
-                results.append({"title": h.get("title", ""), "snippet": h.get("body", ""), "url": url})
+                results.append({
+                    "title": h.get("title", ""),
+                    "snippet": h.get("body", ""),
+                    "url": url,
+                    "source": "ddg_web",
+                })
             time.sleep(1)
         except Exception as e:
-            print(f"Ошибка поиска '{q}': {e}")
+            print(f"Ошибка DuckDuckGo Web '{q}': {e}")
 
-    # Парсим страницы (не все, а только первые 10 уникальных доменов)
+    print(f"   Всего найдено уникальных ссылок: {len(results)}")
+
+    # 4. Парсим страницы (только первые 15 уникальных доменов, чтобы уложиться в лимиты времени GitHub)
     parsed_domains = set()
+    parsed_count = 0
     for r in results:
+        if parsed_count >= 15:
+            r["page_text"] = ""
+            continue
+            
         d = domain(r["url"])
         if d in parsed_domains:
+            r["page_text"] = ""
             continue
+            
         parsed_domains.add(d)
+        parsed_count += 1
         r["page_text"] = extract_page_text(r["url"])
         time.sleep(0.5)
 
@@ -152,7 +208,6 @@ def ask_groq(search_results: list[dict], seen: list[dict]) -> dict:
     today = datetime.now().strftime("%d.%m.%Y")
     seen_text = "\n".join(f"- {s['name']} ({s['domain']}), {s['date']}" for s in seen[-80:]) or "(пусто)"
 
-    # Формируем контекст из поиска
     context_parts = []
     for i, r in enumerate(search_results, 1):
         part = f"{i}. {r['title']}\nURL: {r['url']}\nСниппет: {r['snippet']}"
@@ -225,7 +280,6 @@ def format_message(data: dict) -> str:
         lines.append("<b>Подробности последних обновлений в деталях</b>")
         lines.append("")
         for d in data["details"]:
-            # Преобразуем markdown-жирный в HTML
             d_html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc(d))
             lines.append(f"• {d_html}")
             lines.append("")
@@ -280,7 +334,6 @@ def main() -> None:
         print("Новостей, соответствующих критериям, не найдено.")
         return
 
-    # Фильтруем уже отправленные
     seen_domains = {s["domain"] for s in state["seen"]}
     data["items"] = [
         it for it in data["items"]
