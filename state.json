@@ -1,1 +1,14 @@
-{"seen": []}
+{
+  "seen": [
+    {
+      "name": "Google Vids (Gemini Omni 1.1)",
+      "domain": "news.google.com",
+      "date": "2026-11-04"
+    },
+    {
+      "name": "Google NotebookLM",
+      "domain": "news.google.com",
+      "date": "2026-11-04"
+    }
+  ]
+}
