@@ -323,14 +323,15 @@ def main() -> None:
     print("1. Поиск и парсинг страниц...")
     search_results = search_and_parse()
     print(f"   Найдено {len(search_results)} результатов.")
-
+    for r in search_results:
+        print("  -", r.get("source"), "|", r.get("title", "")[:90], "|", r.get("url", "")[:80])
     print("2. Анализ через Groq...")
     try:
         data = ask_groq(search_results, state["seen"])
     except Exception as e:
         print(f"Ошибка при запросе к Groq: {e}")
         sys.exit(1)
-
+    print(json.dumps(data, ensure_ascii=False)[:1500])
     if not data.get("has_news") or not data.get("items"):
         print("Новостей, соответствующих критериям, не найдено.")
         return
