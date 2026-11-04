@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 
 STATE_FILE = Path(__file__).with_name("state.json")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 SYSTEM_PROMPT = """Ты — аналитик рынка веб-генераторов видео на основе ИИ.
@@ -235,7 +235,7 @@ def ask_groq(search_results: list[dict], seen: list[dict]) -> dict:
             {"role": "user", "content": prompt},
         ],
         temperature=0.1,
-        max_tokens=4000,
+        max_tokens=8000,
         response_format={"type": "json_object"},
     )
 
@@ -329,7 +329,7 @@ def main() -> None:
         data = ask_groq(search_results, state["seen"])
     except Exception as e:
         print(f"Ошибка при запросе к Groq: {e}")
-        return
+        sys.exit(1)
 
     if not data.get("has_news") or not data.get("items"):
         print("Новостей, соответствующих критериям, не найдено.")
