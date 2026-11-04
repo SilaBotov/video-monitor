@@ -15,7 +15,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from duckduckgo_search import DDGS
+from ddgs import DDGS
+import sys
 from bs4 import BeautifulSoup
 from openai import OpenAI
 
