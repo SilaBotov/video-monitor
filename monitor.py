@@ -18,6 +18,10 @@ import requests
 from ddgs import DDGS
 import sys
 from bs4 import BeautifulSoup
+try:
+    from googlenewsdecoder import gnewsdecoder
+except Exception:
+    gnewsdecoder = None
 from openai import OpenAI
 
 STATE_FILE = Path(__file__).with_name("state.json")
@@ -80,6 +84,34 @@ def domain(url: str) -> str:
     return urlparse(url).netloc.lower().removeprefix("www.")
 
 
+# Слова-мусор: такие результаты отбрасываем до отправки в модель
+JUNK_RE = re.compile(
+    r"\b(porn\w*|порно\w*|nsfw|hentai|хент\w*|sex|секс\w*|xxx|samsung|oneplus|oppo|смартфон\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def is_junk(title: str, snippet: str = "") -> bool:
+    return bool(JUNK_RE.search(f"{title} {snippet}"))
+
+
+def clean_html(text: str) -> str:
+    return BeautifulSoup(text or "", "html.parser").get_text(" ", strip=True)
+
+
+def resolve_google_link(link: str) -> str:
+    """Google News отдаёт ссылки-редиректы. Пробуем получить настоящий адрес статьи."""
+    if "news.google.com" not in link or gnewsdecoder is None:
+        return link
+    try:
+        res = gnewsdecoder(link, interval=1)
+        if res.get("status") and res.get("decoded_url"):
+            return res["decoded_url"]
+    except Exception as e:
+        print(f"   Не удалось раскрыть ссылку Google News: {e}")
+    return link
+
+
 def extract_page_text(url: str, max_chars: int = 3000) -> str:
     """Парсит страницу и извлекает основной текст."""
     try:
@@ -97,7 +129,8 @@ def extract_page_text(url: str, max_chars: int = 3000) -> str:
         result = "\n".join(texts)
         return result[:max_chars]
     except Exception as e:
-        return f"[Ошибка парсинга: {e}]"
+        print(f"   Не удалось прочитать {url[:70]}: {e}")
+        return ""
 
 
 def search_and_parse() -> list[dict]:
@@ -113,20 +146,27 @@ def search_and_parse() -> list[dict]:
         "AI video generator Russia available",
         "Adobe Firefly Video free",
         "EaseMate AI video",
+        "new AI video platform launch free credits",
+        "free AI video generator launch",
     ]
     for q in news_queries:
         try:
-            url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=ru&gl=RU&ceid=RU:ru"
+            url = f"https://news.google.com/rss/search?q={requests.utils.quote(q + ' when:7d')}&hl=ru&gl=RU&ceid=RU:ru"
             feed = feedparser.parse(url)
             for entry in feed.entries[:5]:  # Берем топ-5 по каждому запросу
                 link = entry.get("link", "")
-                if not link or link in seen_urls:
+                title = entry.get("title", "")
+                if not link or link in seen_urls or is_junk(title):
                     continue
                 seen_urls.add(link)
+                real_link = resolve_google_link(link)
+                if real_link in seen_urls and real_link != link:
+                    continue
+                seen_urls.add(real_link)
                 results.append({
-                    "title": entry.get("title", ""),
-                    "snippet": entry.get("summary", ""),
-                    "url": link,
+                    "title": title,
+                    "snippet": clean_html(entry.get("summary", ""))[:300],
+                    "url": real_link,
                     "source": "google_news",
                 })
             time.sleep(0.5)
@@ -142,10 +182,10 @@ def search_and_parse() -> list[dict]:
     for q in ddg_news_queries:
         try:
             with DDGS() as ddgs:
-                hits = list(ddgs.news(q, max_results=5))
+                hits = list(ddgs.news(q, max_results=5, timelimit="w"))
             for h in hits:
                 url = h.get("url", "")
-                if not url or url in seen_urls:
+                if not url or url in seen_urls or is_junk(h.get("title", ""), h.get("body", "")):
                     continue
                 seen_urls.add(url)
                 results.append({
@@ -167,10 +207,10 @@ def search_and_parse() -> list[dict]:
     for q in ddg_web_queries:
         try:
             with DDGS() as ddgs:
-                hits = list(ddgs.text(q, max_results=5))
+                hits = list(ddgs.text(q, max_results=5, timelimit="m"))
             for h in hits:
                 url = h.get("href", "")
-                if not url or url in seen_urls:
+                if not url or url in seen_urls or is_junk(h.get("title", ""), h.get("body", "")):
                     continue
                 seen_urls.add(url)
                 results.append({
@@ -212,9 +252,9 @@ def ask_groq(search_results: list[dict], seen: list[dict]) -> dict:
 
     context_parts = []
     for i, r in enumerate(search_results, 1):
-        part = f"{i}. {r['title']}\nURL: {r['url']}\nСниппет: {r['snippet']}"
+        part = f"{i}. {r['title']}\nURL: {r['url']}\nСниппет: {str(r['snippet'])[:300]}"
         if r.get("page_text"):
-            part += f"\nТекст со страницы:\n{r['page_text']}"
+            part += f"\nТекст со страницы:\n{r['page_text'][:900]}"
         context_parts.append(part)
     context = "\n\n---\n\n".join(context_parts)
 
