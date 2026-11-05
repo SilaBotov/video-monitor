@@ -3,3 +3,4 @@ ddgs
 beautifulsoup4
 openai
 feedparser
+googlenewsdecoder
