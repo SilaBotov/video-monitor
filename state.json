@@ -24,6 +24,11 @@
       "name": "Google NotebookLM",
       "domain": "news.google.com",
       "date": "2026-11-04"
+    },
+    {
+      "name": "AIVideoFree",
+      "domain": "markets.businessinsider.com",
+      "date": "2026-11-05"
     }
   ]
 }
