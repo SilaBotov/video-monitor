@@ -27,6 +27,9 @@ from openai import OpenAI
 STATE_FILE = Path(__file__).with_name("state.json")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+# False: сервисы, найденные только обычным веб-поиском (лендинги, каталоги, рейтинги), в пост не попадают.
+# Новостью считаются только материалы из Google News и новостного поиска DuckDuckGo. Поставь True, чтобы вернуть прежнее поведение.
+WEB_RESULTS_CAN_BE_NEWS = False
 
 SYSTEM_PROMPT = """Ты — аналитик рынка веб-генераторов видео на основе ИИ.
 Задача: по предоставленным данным (результаты поиска и тексты страниц) составить отчёт о НОВЫХ платформах и ЗАМЕТНЫХ изменениях условий. Пиши на русском языке.
@@ -38,7 +41,7 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 
 ЧТО ФИКСИРОВАТЬ (только если это прямо указано в источниках):
 - Объём бесплатных ресурсов: секунды, генерации или токены.
-- Тип квоты: daily (обновление каждые 24 часа), trial (разовый приветственный пакет), rolling (скользящие циклы, например 5-часовые в экосистеме Google).
+- Тип квоты: daily (обновление каждые 24 часа), monthly (ежемесячное обновление), trial (разовый приветственный пакет), rolling (скользящие циклы, например 5-часовые в экосистеме Google).
 - Форматы: вертикальный 9:16 (Reels, Shorts, TikTok) и горизонтальный 16:9 (приоритет платформам с 9:16).
 - Бесплатное разрешение: 480p, 720p, HD, Full HD.
 - Водяные знаки на бесплатном тарифе: есть или нет.
@@ -55,6 +58,8 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 - Не указывай страну происхождения сервиса или компании, если источник прямо её не называет.
 - В summary не утверждай про бесплатные тарифы, если для сервиса в items лимиты не указаны.
 - Обзоры, рейтинги и подборки («лучшие», «топ-N», «протестировали», сравнения) НЕ являются новостью о запуске. Не включай сервис только потому, что он упомянут в такой подборке. Включай сервис, только если материал сообщает именно о его запуске, ребрендинге, новой версии или изменении условий. Значение change=new ставь только для реального запуска сервиса.
+- Источники с пометкой «СПРАВОЧНАЯ СТРАНИЦА» (лендинги сервисов, каталоги, рейтинги) не подтверждают, что сервис новый: по ним нельзя создавать карточки и ставить change=new.
+- Все текстовые поля (free_limits, notes, details) пиши по-русски, даже если источник на английском.
 - Не пиши «без ограничений» и «безлимит», если источник прямо не говорит об отсутствии лимитов на количество генераций.
 - Если источник — платный пресс-релиз или рекламный текст (например, businessinsider.com/news/stocks, prnewswire, globenewswire), добавь в notes: «заявление самого сервиса, не проверено».
 - Не повторяй сервисы из списка уже отправленных, если нет СУЩЕСТВЕННЫХ изменений (лимиты, триал, условия, режимы, модели).
@@ -72,7 +77,7 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
       "url": "официальная ссылка или ссылка на источник",
       "official_url": "адрес официального сайта сервиса, только если он явно указан в источниках, иначе пустая строка",
       "free_limits": "объём бесплатных ресурсов (секунды/генерации/токены)",
-      "quota_type": "daily|trial|rolling|не указано",
+      "quota_type": "daily|monthly|trial|rolling|не указано",
       "resolution": "480p|720p|HD|Full HD|не указано",
       "formats": "9:16, 16:9 или не указано",
       "watermark": "есть|нет|не указано",
@@ -332,7 +337,8 @@ def ask_groq(search_results: list[dict], seen: list[dict]) -> dict:
 
     context_parts = []
     for i, r in enumerate(search_results, 1):
-        part = f"{i}. {r['title']}\nURL: {r['url']}\nСниппет: {str(r['snippet'])[:300]}"
+        kind = "НОВОСТЬ" if r.get("source") in ("google_news", "ddg_news") else "СПРАВОЧНАЯ СТРАНИЦА (не новость)"
+        part = f"{i}. [{kind}] {r['title']}\nURL: {r['url']}\nСниппет: {str(r['snippet'])[:300]}"
         if r.get("page_text"):
             part += f"\nТекст со страницы:\n{r['page_text'][:900]}"
         context_parts.append(part)
@@ -357,7 +363,7 @@ NOT_OFFICIAL = (
     "news.google.com", "google.com", "youtube.com", "youtu.be", "reddit.com", "habr.com", "vc.ru",
     "businessinsider.com", "techcrunch.com", "theverge.com", "medium.com", "msn.com", "wikipedia.org",
     "twitter.com", "x.com", "facebook.com", "linkedin.com", "t.me", "tiktok.com", "github.com",
-    "producthunt.com", "aiservicesindex.com", "tenchat.ru", "dzen.ru", "yandex.ru", "bing.com",
+    "producthunt.com", "aiservicesindex.com", "aitoolnet.com", "toolify.ai", "futurepedia.io", "theresanaiforthat.com", "aitools.fyi", "toolradar.com", "feedough.com", "felloai.com", "pexo.ai", "tenchat.ru", "dzen.ru", "yandex.ru", "bing.com",
 )
 
 VERIFY_PROMPT = """Ты проверяешь условия бесплатного доступа AI-видеогенератора ТОЛЬКО по текстам с его собственного сайта.
@@ -366,7 +372,7 @@ VERIFY_PROMPT = """Ты проверяешь условия бесплатног
 {
   "free_access": "да|нет|не указано",
   "free_limits": "бесплатные лимиты именно на ГЕНЕРАЦИЮ ВИДЕО: кредиты, секунды, генерации (кратко, по-русски). Если на сайте указаны лимиты только для изображений или текста, напиши «для видео не указано (для изображений: ...)»",
-  "quota_type": "daily|trial|rolling|не указано",
+  "quota_type": "daily|monthly|trial|rolling|не указано",
   "resolution": "480p|720p|HD|Full HD|не указано",
   "formats": "9:16, 16:9 или не указано",
   "watermark": "есть|нет|не указано",
@@ -382,13 +388,13 @@ def is_official_candidate(host: str) -> bool:
 
 
 def find_official_site(item: dict) -> str:
-    hint = item.get("official_url") or ""
-    if hint.startswith("http") and is_official_candidate(domain(hint)):
-        p = urlparse(hint)
-        return f"{p.scheme}://{p.netloc}"
     name = item.get("name", "")
     words = re.findall(r"[A-Za-z0-9]+", name)
     token = words[0].lower() if words else ""
+    hint = item.get("official_url") or ""
+    if hint.startswith("http") and is_official_candidate(domain(hint)) and (not token or token in domain(hint).replace("-", "")):
+        p = urlparse(hint)
+        return f"{p.scheme}://{p.netloc}"
     if len(token) < 3:
         return ""
     for q in (f"{name} official site", f"{name} pricing free credits", name):
@@ -484,6 +490,9 @@ def verify_items(items: list[dict]) -> None:
                     for key in ("free_limits", "quota_type", "resolution", "formats", "watermark"):
                         v = data.get(key)
                         if v and v != "не указано":
+                            old = str(it.get(key, "")).strip().lower()
+                            if key == "free_limits" and v.lower().startswith("для видео не указано") and old not in ("", "не указано"):
+                                continue
                             it[key] = v
                             if key == "free_limits":
                                 found_limits = True
@@ -502,22 +511,52 @@ def verify_items(items: list[dict]) -> None:
                     verified = True
         except Exception as e:
             print(f"   Проверка '{name}' не удалась: {e}")
-        if verified:
-            # заметка первого этапа могла противоречить данным сайта, поэтому используем только данные сайта
-            notes.append("Условия взяты с официального сайта сервиса.")
-        else:
-            notes = ([old_notes] if old_notes else []) + ["Условия не проверены на сайте сервиса."]
+        if not verified:
+            # заметка первого этапа остаётся; в пост пометки о проверке не попадают, только в лог
+            print(f"   {name}: условия не проверены на сайте сервиса")
+            notes = [old_notes] if old_notes else []
         it["notes"] = " ".join(n.strip() for n in notes if n)
 
 
 REPORT_PROMPT = """Составь текст отчёта ТОЛЬКО по данным из предоставленного JSON со списком сервисов.
 Не добавляй фактов, которых там нет. Не указывай страну происхождения сервисов и компаний. Параметры со значением «не указано» не упоминай вообще. Никогда не ссылайся на «статью», «источник» или «публикацию»: не пиши «в статье отмечается», «по данным источника». Излагай факты напрямую.
-Не упоминай проверку условий и слова «на официальном сайте». Не пиши фраз вроде «не указано», «информация отсутствует», «детали не раскрыты»: если данных нет, просто ничего об этом не говори. Если у сервиса мало данных, опиши его одним коротким предложением.
+Не упоминай проверку условий и слова «на официальном сайте». Не пиши фраз вроде «не указано», «информация отсутствует», «детали не раскрыты»: если данных нет, просто ничего об этом не говори. Если у сервиса мало данных, опиши его одним коротким предложением. Не начинай абзац со слов «Название — новый сервис генерации видео»: сразу переходи к условиям и возможностям.
 Пиши по-русски. Верни СТРОГО один JSON-объект:
 {
   "summary": "2-3 предложения о том, что изменилось на рынке, без утверждений, которых нет в данных",
   "details": ["**Название:** абзац 3-5 предложений по каждому сервису: что это, бесплатные условия, форматы, режимы, модели"]
 }"""
+
+
+def latin_ratio(text: str) -> float:
+    letters = [c for c in str(text or "") if c.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(1 for c in letters if "a" <= c.lower() <= "z") / len(letters)
+
+
+def russify_items(items: list[dict]) -> None:
+    """Переводит на русский поля карточек (лимиты, заметки), которые остались на английском."""
+    todo = {}
+    for i, it in enumerate(items):
+        for key in ("free_limits", "notes"):
+            v = it.get(key)
+            if v and latin_ratio(v) > 0.5:
+                todo[f"{i}.{key}"] = v
+    if not todo:
+        return
+    try:
+        res = call_groq(
+            "Переведи значения на русский язык. Сохрани числа, названия сервисов и моделей (Veo, Kling и т.п.) без изменений. "
+            "Ничего не добавляй и не пропускай. Верни СТРОГО один JSON-объект с теми же ключами.",
+            json.dumps(todo, ensure_ascii=False), 1500,
+        )
+        for k, v in res.items():
+            if k in todo and isinstance(v, str) and v.strip():
+                i, key = k.split(".", 1)
+                items[int(i)][key] = v.strip()
+    except Exception as e:
+        print(f"   Не удалось перевести поля на русский: {e}")
 
 
 def rewrite_report(data: dict) -> None:
@@ -600,7 +639,7 @@ def format_message(data: dict) -> str:
         lines.append(f"{tag} — <b>{title}</b>")
         if str(it.get("free_limits", "")).strip().lower() not in ("", "не указано", "для видео не указано"):
             lines.append(f"🎁 {esc(it.get('free_limits'))}")
-        quota = {"daily": "ежедневное обновление", "trial": "разовый триал", "rolling": "скользящие циклы"}
+        quota = {"daily": "ежедневное обновление", "trial": "разовый триал", "rolling": "скользящие циклы", "monthly": "ежемесячное обновление"}
         specs = []
         if it.get("quota_type") and it["quota_type"] != "не указано":
             specs.append(f"квота: {quota.get(it['quota_type'], it['quota_type'])}")
@@ -678,6 +717,13 @@ def main() -> None:
         print(f"Ошибка при запросе к Groq: {e}")
         sys.exit(1)
     print(json.dumps(data, ensure_ascii=False)[:1500])
+    if not WEB_RESULTS_CAN_BE_NEWS and data.get("items"):
+        web_urls = {r["url"] for r in search_results if r.get("source") == "ddg_web"}
+        kept = [it for it in data["items"] if it.get("url") not in web_urls]
+        if len(kept) < len(data["items"]):
+            dropped = [it.get("name", "?") for it in data["items"] if it.get("url") in web_urls]
+            print(f"   Отсеяны сервисы, найденные только справочными страницами: {', '.join(dropped)}")
+        data["items"] = kept
     if not data.get("has_news") or not data.get("items"):
         print("Новостей, соответствующих критериям, не найдено.")
         return
@@ -707,6 +753,7 @@ def main() -> None:
         return
 
     print("2.7 Обновление текста отчёта по проверенным данным...")
+    russify_items(data["items"])
     rewrite_report(data)
 
     print("3. Отправка в Telegram...")
