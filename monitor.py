@@ -511,11 +511,39 @@ def verify_items(items: list[dict]) -> None:
                     verified = True
         except Exception as e:
             print(f"   Проверка '{name}' не удалась: {e}")
-        if not verified:
-            # заметка первого этапа остаётся; в пост пометки о проверке не попадают, только в лог
-            print(f"   {name}: условия не проверены на сайте сервиса")
-            notes = [old_notes] if old_notes else []
+        if not verified and old_notes:
+            notes = [old_notes] + notes
+        # если сайт проверен, заметка первого этапа могла противоречить данным сайта, поэтому берём только данные сайта
         it["notes"] = " ".join(n.strip() for n in notes if n)
+
+
+def mostly_latin(text: str) -> bool:
+    lat = len(re.findall(r"[A-Za-z]", text or ""))
+    cyr = len(re.findall(r"[А-Яа-яЁё]", text or ""))
+    return lat > 12 and lat > cyr
+
+
+TRANSLATE_PROMPT = """Переведи на русский язык значения полей, сохранив смысл и числа. Названия сервисов, моделей и технические термины (Image-to-Video, 720p, Full HD и т.п.) оставь как есть. Ничего не добавляй.
+Верни СТРОГО один JSON-объект с теми же ключами, что во входных данных."""
+
+
+def translate_items(items: list[dict]) -> None:
+    """Если в карточке остался английский текст (лимиты, заметки), переводим его на русский."""
+    todo = {}
+    for i, it in enumerate(items):
+        for key in ("free_limits", "notes"):
+            if mostly_latin(str(it.get(key, ""))):
+                todo[f"{i}:{key}"] = it[key]
+    if not todo:
+        return
+    try:
+        res = call_groq(TRANSLATE_PROMPT, json.dumps(todo, ensure_ascii=False), 1500)
+        for k, v in todo.items():
+            i, key = k.split(":")
+            if isinstance(res.get(k), str) and res[k].strip():
+                items[int(i)][key] = res[k].strip()
+    except Exception as e:
+        print(f"   Не удалось перевести английский текст: {e}")
 
 
 REPORT_PROMPT = """Составь текст отчёта ТОЛЬКО по данным из предоставленного JSON со списком сервисов.
@@ -528,37 +556,6 @@ REPORT_PROMPT = """Составь текст отчёта ТОЛЬКО по да
 }"""
 
 
-def latin_ratio(text: str) -> float:
-    letters = [c for c in str(text or "") if c.isalpha()]
-    if not letters:
-        return 0.0
-    return sum(1 for c in letters if "a" <= c.lower() <= "z") / len(letters)
-
-
-def russify_items(items: list[dict]) -> None:
-    """Переводит на русский поля карточек (лимиты, заметки), которые остались на английском."""
-    todo = {}
-    for i, it in enumerate(items):
-        for key in ("free_limits", "notes"):
-            v = it.get(key)
-            if v and latin_ratio(v) > 0.5:
-                todo[f"{i}.{key}"] = v
-    if not todo:
-        return
-    try:
-        res = call_groq(
-            "Переведи значения на русский язык. Сохрани числа, названия сервисов и моделей (Veo, Kling и т.п.) без изменений. "
-            "Ничего не добавляй и не пропускай. Верни СТРОГО один JSON-объект с теми же ключами.",
-            json.dumps(todo, ensure_ascii=False), 1500,
-        )
-        for k, v in res.items():
-            if k in todo and isinstance(v, str) and v.strip():
-                i, key = k.split(".", 1)
-                items[int(i)][key] = v.strip()
-    except Exception as e:
-        print(f"   Не удалось перевести поля на русский: {e}")
-
-
 def rewrite_report(data: dict) -> None:
     """Переписываем summary и details по проверенным данным, чтобы текст не противоречил карточкам."""
     try:
@@ -566,7 +563,7 @@ def rewrite_report(data: dict) -> None:
         for it in data.get("items", []):
             d = {k: v for k, v in it.items() if k not in ("notes", "official_url", "url", "access_type")}
             d = {k: v for k, v in d.items() if v not in ("не указано", "", [], None)}
-            notes = re.sub(r"Условия (?:взяты|проверены)[^.]*\.", "", it.get("notes", "")).strip()
+            notes = it.get("notes", "").strip()
             if notes:
                 d["notes"] = notes
             slim.append(d)
@@ -752,8 +749,8 @@ def main() -> None:
         print("Все найденные сервисы уже отправлялись ранее.")
         return
 
+    translate_items(data["items"])
     print("2.7 Обновление текста отчёта по проверенным данным...")
-    russify_items(data["items"])
     rewrite_report(data)
 
     print("3. Отправка в Telegram...")
