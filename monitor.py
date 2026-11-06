@@ -50,7 +50,8 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 Сообщай о NotebookLM ТОЛЬКО если появился полноценный художественный видеогенератор по свободному текстовому промпту с нуля, независимый от загруженных документов (в Studio Panel или в коде сервиса). Видеообзоры (Video Overviews) по заметкам и документам, регистрация товарных знаков, переименования и прочие обновления — НЕ триггер.
 
 ПРАВИЛА ДОСТОВЕРНОСТИ:
-- Используй только факты, явно указанные в источниках. Если параметр не указан, пиши «не указано» и не домысливай. Не делай выводов о намерениях компаний и о будущей доступности.
+- Используй только факты, явно указанные в источниках. Если параметр не указан, ставь «не указано» в полях карточки и не домысливай; в текстах (summary, notes, details) недостающую информацию просто не упоминай.
+- В текстах никогда не ссылайся на «статью», «источник», «публикацию» или «материал»: не пиши «в статье отмечается», «по данным источника», «в источнике нет информации». Излагай факты напрямую, от своего лица. Не делай выводов о намерениях компаний и о будущей доступности.
 - Не указывай страну происхождения сервиса или компании, если источник прямо её не называет.
 - В summary не утверждай про бесплатные тарифы, если для сервиса в items лимиты не указаны.
 - Не пиши «без ограничений» и «безлимит», если источник прямо не говорит об отсутствии лимитов на количество генераций.
@@ -136,7 +137,7 @@ def resolve_google_link(link: str) -> str:
         return link
     try:
         res = gnewsdecoder(link, interval=1)
-        if res.get("status") and res.get("decoded_url"):
+        if (res.get("status") or res.get("success")) and res.get("decoded_url"):
             return res["decoded_url"]
         print(f"   Ссылка Google News не раскрыта: {str(res)[:150]}")
     except Exception as e:
@@ -163,6 +164,16 @@ def extract_page_text(url: str, max_chars: int = 3000) -> str:
     except Exception as e:
         print(f"   Не удалось прочитать {url[:70]}: {e}")
         return ""
+
+
+def ddg_call(fn, q: str, timelimit: str) -> list:
+    """Поиск DuckDuckGo: сначала с фильтром по дате, при неудаче — без него."""
+    try:
+        return list(fn(q, max_results=5, timelimit=timelimit))
+    except Exception as e:
+        print(f"   DuckDuckGo: '{q[:45]}' с фильтром по дате не удался ({e}), пробую без него")
+        time.sleep(2)
+        return list(fn(q, max_results=5))
 
 
 def search_and_parse() -> list[dict]:
@@ -218,7 +229,7 @@ def search_and_parse() -> list[dict]:
     for q in ddg_news_queries:
         try:
             with DDGS() as ddgs:
-                hits = list(ddgs.news(q, max_results=5, timelimit="w"))
+                hits = ddg_call(ddgs.news, q, "w")
             for h in hits:
                 url = h.get("url", "")
                 if not url or url in seen_urls or is_junk(h.get("title", ""), h.get("body", "")) \
@@ -244,7 +255,7 @@ def search_and_parse() -> list[dict]:
     for q in ddg_web_queries:
         try:
             with DDGS() as ddgs:
-                hits = list(ddgs.text(q, max_results=5, timelimit="m"))
+                hits = ddg_call(ddgs.text, q, "m")
             for h in hits:
                 url = h.get("href", "")
                 if not url or url in seen_urls or is_junk(h.get("title", ""), h.get("body", "")) \
@@ -339,7 +350,7 @@ VERIFY_PROMPT = """Ты проверяешь условия бесплатног
 Верни СТРОГО один JSON-объект:
 {
   "free_access": "да|нет|не указано",
-  "free_limits": "объём бесплатных ресурсов: кредиты, секунды, генерации (кратко)",
+  "free_limits": "бесплатные лимиты именно на ГЕНЕРАЦИЮ ВИДЕО: кредиты, секунды, генерации (кратко, по-русски). Если на сайте указаны лимиты только для изображений или текста, напиши «для видео не указано (для изображений: ...)»",
   "quota_type": "daily|trial|rolling|не указано",
   "resolution": "480p|720p|HD|Full HD|не указано",
   "formats": "9:16, 16:9 или не указано",
@@ -406,7 +417,8 @@ def verify_items(items: list[dict]) -> None:
     """Для каждого сервиса пытаемся подтвердить условия по его официальному сайту."""
     for it in items:
         name = it.get("name", "")
-        notes = [it.get("notes", "")] if it.get("notes") else []
+        old_notes = it.get("notes", "")
+        notes = []
         verified = False
         try:
             site = find_official_site(it)
@@ -414,17 +426,21 @@ def verify_items(items: list[dict]) -> None:
                 print(f"   {name}: официальный сайт не найден")
             else:
                 text = fetch_site_texts(site)
+                print(f"   {name}: сайт {site}, прочитано {len(text)} символов")
                 if len(text) < 300:
-                    print(f"   {name}: на {site} мало текста (возможно, страница грузится скриптами)")
+                    print(f"   {name}: мало текста (возможно, страница грузится скриптами)")
                     it["url"] = site
                 else:
                     data = call_groq(VERIFY_PROMPT, f"Сервис: {name}\nСайт: {site}\n\n{text[:7000]}", 1500)
                     time.sleep(3)
                     it["url"] = site
+                    found_limits = False
                     for key in ("free_limits", "quota_type", "resolution", "formats", "watermark"):
                         v = data.get(key)
                         if v and v != "не указано":
                             it[key] = v
+                            if key == "free_limits":
+                                found_limits = True
                     for key in ("modes", "models"):
                         if data.get(key):
                             it[key] = data[key]
@@ -434,13 +450,39 @@ def verify_items(items: list[dict]) -> None:
                         notes.append("Требуется привязка карты.")
                     if data.get("russia") and data["russia"] != "не указано":
                         notes.append(f"Доступность в РФ: {data['russia']}.")
-                    if data.get("free_access") == "нет":
+                    if data.get("free_access") == "нет" and not found_limits:
                         notes.append("На сайте бесплатный доступ не обнаружен.")
                     verified = True
         except Exception as e:
             print(f"   Проверка '{name}' не удалась: {e}")
-        notes.append("Условия проверены на официальном сайте." if verified else "Условия не проверены на сайте сервиса.")
+        if verified:
+            # заметка первого этапа могла противоречить данным сайта, поэтому используем только данные сайта
+            notes.append("Условия проверены на официальном сайте.")
+        else:
+            notes = ([old_notes] if old_notes else []) + ["Условия не проверены на сайте сервиса."]
         it["notes"] = " ".join(n.strip() for n in notes if n)
+
+
+REPORT_PROMPT = """Составь текст отчёта ТОЛЬКО по данным из предоставленного JSON со списком сервисов.
+Не добавляй фактов, которых там нет. Не указывай страну происхождения сервисов и компаний. Параметры со значением «не указано» не упоминай вообще. Никогда не ссылайся на «статью», «источник» или «публикацию»: не пиши «в статье отмечается», «по данным источника». Излагай факты напрямую.
+Пиши по-русски. Верни СТРОГО один JSON-объект:
+{
+  "summary": "2-3 предложения о том, что изменилось на рынке, без утверждений, которых нет в данных",
+  "details": ["**Название:** абзац 3-5 предложений по каждому сервису: что это, бесплатные условия, форматы, режимы, модели"]
+}"""
+
+
+def rewrite_report(data: dict) -> None:
+    """Переписываем summary и details по проверенным данным, чтобы текст не противоречил карточкам."""
+    try:
+        payload = json.dumps(data.get("items", []), ensure_ascii=False)
+        res = call_groq(REPORT_PROMPT, payload[:7000], 3000)
+        if res.get("summary"):
+            data["summary"] = res["summary"]
+        if res.get("details"):
+            data["details"] = res["details"]
+    except Exception as e:
+        print(f"   Не удалось переписать отчёт по проверенным данным: {e}")
 
 
 def esc(s: str) -> str:
@@ -454,10 +496,28 @@ ACCESS_TAGS = {
 }
 
 
+SRC_VERBS = r"(?:отмечается|отмечено|сообщается|указано|указывается|говорится|написано|подчёркивается|упоминается|утверждается)"
+SRC_NOUNS = r"(?:статье|источнику|материалу|публикации|источнике|тексте)"
+SRC_START_RE = re.compile(
+    r"(?P<pre>^|[.!?]\s+|\*\*\s*)(?:В|Согласно|По данным)\s+" + SRC_NOUNS + r"\s+" + SRC_VERBS + r"(?:,?\s*что)?[,:]?\s*(?P<c>\S)",
+    re.IGNORECASE,
+)
+SRC_MID_RE = re.compile(
+    r",?\s*(?:в|согласно|по данным)\s+" + SRC_NOUNS + r"\s+" + SRC_VERBS + r"(?:,?\s*что)?[,:]?\s*",
+    re.IGNORECASE,
+)
+
+
+def clean_src(text: str) -> str:
+    """Убирает обороты вроде «В статье отмечается, что»."""
+    text = SRC_START_RE.sub(lambda m: m.group("pre") + m.group("c").upper(), str(text or ""))
+    return SRC_MID_RE.sub(lambda m: ", " if m.group(0).lstrip().startswith(",") else " ", text)
+
+
 def format_message(data: dict) -> str:
     lines = [f"<b>{esc(data.get('headline', 'Свежие изменения в условиях и лимитах веб-платформ'))}</b>", ""]
     if data.get("summary"):
-        lines += [esc(data["summary"]), ""]
+        lines += [esc(clean_src(data["summary"])), ""]
 
     for it in data.get("items", []):
         change = it.get("change", "new")
@@ -487,14 +547,14 @@ def format_message(data: dict) -> str:
         if it.get("models"):
             lines.append("🤖 " + esc(", ".join(map(str, it["models"]))))
         if it.get("notes"):
-            lines.append(f"ℹ️ {esc(it['notes'])}")
+            lines.append(f"ℹ️ {esc(clean_src(it['notes']))}")
         lines.append("")
 
     if data.get("details"):
         lines.append("<b>Подробности последних обновлений в деталях</b>")
         lines.append("")
         for d in data["details"]:
-            d_html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc(d))
+            d_html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc(clean_src(d)))
             lines.append(f"• {d_html}")
             lines.append("")
 
@@ -572,6 +632,9 @@ def main() -> None:
     if not data["items"]:
         print("Все найденные сервисы уже отправлялись ранее.")
         return
+
+    print("2.7 Обновление текста отчёта по проверенным данным...")
+    rewrite_report(data)
 
     print("3. Отправка в Telegram...")
     send_telegram(format_message(data))
