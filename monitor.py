@@ -12,7 +12,7 @@ import time
 import feedparser
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from ddgs import DDGS
@@ -54,6 +54,7 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 - В текстах никогда не ссылайся на «статью», «источник», «публикацию» или «материал»: не пиши «в статье отмечается», «по данным источника», «в источнике нет информации». Излагай факты напрямую, от своего лица. Не делай выводов о намерениях компаний и о будущей доступности.
 - Не указывай страну происхождения сервиса или компании, если источник прямо её не называет.
 - В summary не утверждай про бесплатные тарифы, если для сервиса в items лимиты не указаны.
+- Обзоры, рейтинги и подборки («лучшие», «топ-N», «протестировали», сравнения) НЕ являются новостью о запуске. Не включай сервис только потому, что он упомянут в такой подборке. Включай сервис, только если материал сообщает именно о его запуске, ребрендинге, новой версии или изменении условий. Значение change=new ставь только для реального запуска сервиса.
 - Не пиши «без ограничений» и «безлимит», если источник прямо не говорит об отсутствии лимитов на количество генераций.
 - Если источник — платный пресс-релиз или рекламный текст (например, businessinsider.com/news/stocks, prnewswire, globenewswire), добавь в notes: «заявление самого сервиса, не проверено».
 - Не повторяй сервисы из списка уже отправленных, если нет СУЩЕСТВЕННЫХ изменений (лимиты, триал, условия, режимы, модели).
@@ -122,6 +123,20 @@ VIDEO_RE = re.compile(
 def is_relevant(title: str, snippet: str = "") -> bool:
     """Оставляем только материалы, где вообще речь о видео или генерации."""
     return bool(VIDEO_RE.search(f"{title} {snippet}"))
+
+
+def as_list(v) -> list:
+    """Приводит значение к списку строк и убирает «не указано»."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        v = [v]
+    out = []
+    for x in v:
+        x = str(x).strip()
+        if x and x.lower() not in ("не указано", "не указаны", "none", "-"):
+            out.append(x)
+    return out
 
 
 def clean_html(text: str) -> str:
@@ -400,10 +415,41 @@ def find_official_site(item: dict) -> str:
     return ""
 
 
+PRICE_RE = re.compile(r"pric|plan|subscri|credit|тариф|цен", re.IGNORECASE)
+
+
+def find_price_links(site: str, limit: int = 2) -> list[str]:
+    """Ищет на главной странице ссылки на тарифы, кредиты и планы."""
+    try:
+        r = requests.get(site, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=10)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+    except Exception:
+        return []
+    host = domain(site)
+    found: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        label = a.get_text(" ", strip=True)
+        if not (PRICE_RE.search(href) or PRICE_RE.search(label)):
+            continue
+        full = urljoin(site.rstrip("/") + "/", href).split("#")[0]
+        if domain(full) != host or full.rstrip("/") == site.rstrip("/") or full in found:
+            continue
+        found.append(full)
+        if len(found) >= limit:
+            break
+    return found
+
+
 def fetch_site_texts(site: str) -> str:
-    parts = []
-    for path in ["", "/pricing", "/plans", "/price"]:
-        u = site.rstrip("/") + path
+    base = site.rstrip("/")
+    urls = [base] + find_price_links(site) + [base + "/pricing", base + "/plans"]
+    parts, tried = [], set()
+    for u in urls:
+        if u in tried:
+            continue
+        tried.add(u)
         t = extract_page_text(u, max_chars=2500)
         if len(t) > 150:
             parts.append(f"[{u}]\n{t}")
@@ -442,8 +488,9 @@ def verify_items(items: list[dict]) -> None:
                             if key == "free_limits":
                                 found_limits = True
                     for key in ("modes", "models"):
-                        if data.get(key):
-                            it[key] = data[key]
+                        vals = as_list(data.get(key))
+                        if vals:
+                            it[key] = vals
                     if data.get("card_required") == "нет":
                         notes.append("Привязка карты не требуется.")
                     elif data.get("card_required") == "да":
@@ -457,7 +504,7 @@ def verify_items(items: list[dict]) -> None:
             print(f"   Проверка '{name}' не удалась: {e}")
         if verified:
             # заметка первого этапа могла противоречить данным сайта, поэтому используем только данные сайта
-            notes.append("Условия проверены на официальном сайте.")
+            notes.append("Условия взяты с официального сайта сервиса.")
         else:
             notes = ([old_notes] if old_notes else []) + ["Условия не проверены на сайте сервиса."]
         it["notes"] = " ".join(n.strip() for n in notes if n)
@@ -465,6 +512,7 @@ def verify_items(items: list[dict]) -> None:
 
 REPORT_PROMPT = """Составь текст отчёта ТОЛЬКО по данным из предоставленного JSON со списком сервисов.
 Не добавляй фактов, которых там нет. Не указывай страну происхождения сервисов и компаний. Параметры со значением «не указано» не упоминай вообще. Никогда не ссылайся на «статью», «источник» или «публикацию»: не пиши «в статье отмечается», «по данным источника». Излагай факты напрямую.
+Не упоминай проверку условий и слова «на официальном сайте». Не пиши фраз вроде «не указано», «информация отсутствует», «детали не раскрыты»: если данных нет, просто ничего об этом не говори. Если у сервиса мало данных, опиши его одним коротким предложением.
 Пиши по-русски. Верни СТРОГО один JSON-объект:
 {
   "summary": "2-3 предложения о том, что изменилось на рынке, без утверждений, которых нет в данных",
@@ -475,7 +523,15 @@ REPORT_PROMPT = """Составь текст отчёта ТОЛЬКО по да
 def rewrite_report(data: dict) -> None:
     """Переписываем summary и details по проверенным данным, чтобы текст не противоречил карточкам."""
     try:
-        payload = json.dumps(data.get("items", []), ensure_ascii=False)
+        slim = []
+        for it in data.get("items", []):
+            d = {k: v for k, v in it.items() if k not in ("notes", "official_url", "url", "access_type")}
+            d = {k: v for k, v in d.items() if v not in ("не указано", "", [], None)}
+            notes = re.sub(r"Условия (?:взяты|проверены)[^.]*\.", "", it.get("notes", "")).strip()
+            if notes:
+                d["notes"] = notes
+            slim.append(d)
+        payload = json.dumps(slim, ensure_ascii=False)
         res = call_groq(REPORT_PROMPT, payload[:7000], 3000)
         if res.get("summary"):
             data["summary"] = res["summary"]
@@ -514,10 +570,23 @@ def clean_src(text: str) -> str:
     return SRC_MID_RE.sub(lambda m: ", " if m.group(0).lstrip().startswith(",") else " ", text)
 
 
+UNKNOWN_RE = re.compile(r"не указан|не раскрыт|не уточнен|отсутству|нет (?:данных|информации)|неизвестн", re.IGNORECASE)
+
+
+def drop_unknown(text: str) -> str:
+    """Убирает фразы вроде «информация о лимитах не указана»."""
+    out = []
+    for sent in re.split(r"(?<=[.!?])\s+", str(text or "")):
+        clauses = [c for c in re.split(r";\s*", sent) if c.strip() and not UNKNOWN_RE.search(c)]
+        if clauses:
+            out.append("; ".join(c.strip().rstrip(".!?") for c in clauses) + ".")
+    return " ".join(out)
+
+
 def format_message(data: dict) -> str:
     lines = [f"<b>{esc(data.get('headline', 'Свежие изменения в условиях и лимитах веб-платформ'))}</b>", ""]
     if data.get("summary"):
-        lines += [esc(clean_src(data["summary"])), ""]
+        lines += [esc(drop_unknown(clean_src(data["summary"]))), ""]
 
     for it in data.get("items", []):
         change = it.get("change", "new")
@@ -529,7 +598,8 @@ def format_message(data: dict) -> str:
         title = f'<a href="{html.escape(url, quote=True)}">{name}</a>' if url else name
 
         lines.append(f"{tag} — <b>{title}</b>")
-        lines.append(f"🎁 {esc(it.get('free_limits'))}")
+        if str(it.get("free_limits", "")).strip().lower() not in ("", "не указано", "для видео не указано"):
+            lines.append(f"🎁 {esc(it.get('free_limits'))}")
         quota = {"daily": "ежедневное обновление", "trial": "разовый триал", "rolling": "скользящие циклы"}
         specs = []
         if it.get("quota_type") and it["quota_type"] != "не указано":
@@ -542,10 +612,10 @@ def format_message(data: dict) -> str:
             specs.append(f"водяной знак: {it['watermark']}")
         if specs:
             lines.append("⚙️ " + esc("; ".join(specs)))
-        if it.get("modes"):
-            lines.append("🎬 " + esc(", ".join(map(str, it["modes"]))))
-        if it.get("models"):
-            lines.append("🤖 " + esc(", ".join(map(str, it["models"]))))
+        if as_list(it.get("modes")):
+            lines.append("🎬 " + esc(", ".join(as_list(it["modes"]))))
+        if as_list(it.get("models")):
+            lines.append("🤖 " + esc(", ".join(as_list(it["models"]))))
         if it.get("notes"):
             lines.append(f"ℹ️ {esc(clean_src(it['notes']))}")
         lines.append("")
@@ -554,7 +624,10 @@ def format_message(data: dict) -> str:
         lines.append("<b>Подробности последних обновлений в деталях</b>")
         lines.append("")
         for d in data["details"]:
-            d_html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc(clean_src(d)))
+            d_clean = drop_unknown(clean_src(d))
+            if len(re.sub(r"\*\*.*?\*\*", "", d_clean).strip()) < 15:
+                continue
+            d_html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc(d_clean))
             lines.append(f"• {d_html}")
             lines.append("")
 
