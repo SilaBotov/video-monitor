@@ -33,7 +33,7 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 
 КРИТЕРИИ ОТБОРА (обязательные):
 1. Работает напрямую в браузере на сайте. Инструменты только через Discord или Telegram-ботов исключаются.
-2. Есть бесплатный тариф или триал: стартовые кредиты при регистрации, ежедневно возобновляемые квоты или безлимитные демо-режимы. Привязка банковской карты для бесплатного старта не требуется.
+2. Есть бесплатный тариф или триал: стартовые кредиты при регистрации, ежедневно возобновляемые квоты или безлимитные демо-режимы. Включай сервис при ЛЮБОМ бесплатном доступе, даже ограниченном. Привязку банковской карты не считай препятствием: если источник говорит, требуется ли она, укажи это в notes.
 3. Это реальный запуск или изменение лимитов/условий, а не обзор, рейтинг или реклама.
 
 ЧТО ФИКСИРОВАТЬ (только если это прямо указано в источниках):
@@ -51,6 +51,8 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 
 ПРАВИЛА ДОСТОВЕРНОСТИ:
 - Используй только факты, явно указанные в источниках. Если параметр не указан, пиши «не указано» и не домысливай. Не делай выводов о намерениях компаний и о будущей доступности.
+- Не указывай страну происхождения сервиса или компании, если источник прямо её не называет.
+- В summary не утверждай про бесплатные тарифы, если для сервиса в items лимиты не указаны.
 - Не пиши «без ограничений» и «безлимит», если источник прямо не говорит об отсутствии лимитов на количество генераций.
 - Если источник — платный пресс-релиз или рекламный текст (например, businessinsider.com/news/stocks, prnewswire, globenewswire), добавь в notes: «заявление самого сервиса, не проверено».
 - Не повторяй сервисы из списка уже отправленных, если нет СУЩЕСТВЕННЫХ изменений (лимиты, триал, условия, режимы, модели).
@@ -66,6 +68,7 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
     {
       "name": "название сервиса",
       "url": "официальная ссылка или ссылка на источник",
+      "official_url": "адрес официального сайта сервиса, только если он явно указан в источниках, иначе пустая строка",
       "free_limits": "объём бесплатных ресурсов (секунды/генерации/токены)",
       "quota_type": "daily|trial|rolling|не указано",
       "resolution": "480p|720p|HD|Full HD|не указано",
@@ -162,6 +165,9 @@ def search_and_parse() -> list[dict]:
         "EaseMate AI video",
         "new AI video platform launch free credits",
         "free AI video generator launch",
+        "AI video generator rebrand",
+        "AI video generator launches free credits sign up",
+        "AI video studio launch free trial",
     ]
     for q in news_queries:
         try:
@@ -192,6 +198,7 @@ def search_and_parse() -> list[dict]:
         f"new free AI video generator browser no credit card {year}",
         f"Google NotebookLM video generation update {year}",
         f"AI video generator available Russia VPN {year}",
+        f"AI video generator rebrand launch free credits {year}",
     ]
     for q in ddg_news_queries:
         try:
@@ -260,6 +267,36 @@ def search_and_parse() -> list[dict]:
     return results
 
 
+def call_groq(system: str, user: str, max_tokens: int = 4000) -> dict:
+    """Один запрос к Groq, ответ — JSON. При превышении лимита ждёт и повторяет один раз."""
+    client = OpenAI(base_url=GROQ_BASE_URL, api_key=os.environ["GROQ_API_KEY"])
+    response = None
+    for attempt in range(2):
+        try:
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.1,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+            break
+        except Exception as e:
+            if attempt == 0 and "429" in str(e):
+                print("   Лимит Groq, жду 30 секунд и повторяю...")
+                time.sleep(30)
+                continue
+            raise
+    text = response.choices[0].message.content
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError(f"Нет JSON в ответе Groq: {text[:500]}")
+    return json.loads(match.group(0))
+
+
 def ask_groq(search_results: list[dict], seen: list[dict]) -> dict:
     today = datetime.now().strftime("%d.%m.%Y")
     seen_text = "\n".join(f"- {s['name']} ({s['domain']}), {s['date']}" for s in seen[-80:]) or "(пусто)"
@@ -282,23 +319,115 @@ def ask_groq(search_results: list[dict], seen: list[dict]) -> dict:
 
 Проанализируй данные и верни СТРОГО JSON согласно инструкции в системном промпте."""
 
-    client = OpenAI(base_url=GROQ_BASE_URL, api_key=os.environ["GROQ_API_KEY"])
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.1,
-        max_tokens=8000,
-        response_format={"type": "json_object"},
-    )
+    return call_groq(SYSTEM_PROMPT, prompt, 8000)
 
-    text = response.choices[0].message.content
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError(f"Нет JSON в ответе Groq: {text[:500]}")
-    return json.loads(match.group(0))
+
+# ---------- Этап 2: проверка условий на официальном сайте сервиса ----------
+
+NOT_OFFICIAL = (
+    "news.google.com", "google.com", "youtube.com", "youtu.be", "reddit.com", "habr.com", "vc.ru",
+    "businessinsider.com", "techcrunch.com", "theverge.com", "medium.com", "msn.com", "wikipedia.org",
+    "twitter.com", "x.com", "facebook.com", "linkedin.com", "t.me", "tiktok.com", "github.com",
+    "producthunt.com", "aiservicesindex.com", "tenchat.ru", "dzen.ru", "yandex.ru", "bing.com",
+)
+
+VERIFY_PROMPT = """Ты проверяешь условия бесплатного доступа AI-видеогенератора ТОЛЬКО по текстам с его собственного сайта.
+Используй исключительно факты из предоставленных текстов. Если параметр не указан, пиши «не указано». Ничего не домысливай и не указывай страну происхождения.
+Верни СТРОГО один JSON-объект:
+{
+  "free_access": "да|нет|не указано",
+  "free_limits": "объём бесплатных ресурсов: кредиты, секунды, генерации (кратко)",
+  "quota_type": "daily|trial|rolling|не указано",
+  "resolution": "480p|720p|HD|Full HD|не указано",
+  "formats": "9:16, 16:9 или не указано",
+  "watermark": "есть|нет|не указано",
+  "modes": ["Image-to-Video", "Start & End Frame", "липсинк", "нативный звук", "Consistent Characters"],
+  "models": ["названия видеомоделей, доступных в сервисе"],
+  "card_required": "да|нет|не указано",
+  "russia": "напрямую|через VPN|заблокирован|не указано"
+}"""
+
+
+def is_official_candidate(host: str) -> bool:
+    return not any(host == d or host.endswith("." + d) for d in NOT_OFFICIAL)
+
+
+def find_official_site(item: dict) -> str:
+    hint = item.get("official_url") or ""
+    if hint.startswith("http") and is_official_candidate(domain(hint)):
+        p = urlparse(hint)
+        return f"{p.scheme}://{p.netloc}"
+    words = re.findall(r"[A-Za-z0-9]+", item.get("name", ""))
+    token = words[0].lower() if words else ""
+    if len(token) < 3:
+        return ""
+    try:
+        with DDGS() as ddgs:
+            hits = list(ddgs.text(f"{item.get('name', '')} AI video generator official site", max_results=8))
+    except Exception as e:
+        print(f"   Поиск сайта '{item.get('name')}' не удался: {e}")
+        return ""
+    for h in hits:
+        u = h.get("href", "")
+        host = domain(u)
+        if u and is_official_candidate(host) and token in host.replace("-", ""):
+            p = urlparse(u)
+            return f"{p.scheme}://{p.netloc}"
+    return ""
+
+
+def fetch_site_texts(site: str) -> str:
+    parts = []
+    for path in ["", "/pricing", "/plans", "/price"]:
+        u = site.rstrip("/") + path
+        t = extract_page_text(u, max_chars=2500)
+        if len(t) > 150:
+            parts.append(f"[{u}]\n{t}")
+        time.sleep(0.5)
+        if len(parts) >= 3:
+            break
+    return "\n\n".join(parts)
+
+
+def verify_items(items: list[dict]) -> None:
+    """Для каждого сервиса пытаемся подтвердить условия по его официальному сайту."""
+    for it in items:
+        name = it.get("name", "")
+        notes = [it.get("notes", "")] if it.get("notes") else []
+        verified = False
+        try:
+            site = find_official_site(it)
+            if not site:
+                print(f"   {name}: официальный сайт не найден")
+            else:
+                text = fetch_site_texts(site)
+                if len(text) < 300:
+                    print(f"   {name}: на {site} мало текста (возможно, страница грузится скриптами)")
+                    it["url"] = site
+                else:
+                    data = call_groq(VERIFY_PROMPT, f"Сервис: {name}\nСайт: {site}\n\n{text[:7000]}", 1500)
+                    time.sleep(3)
+                    it["url"] = site
+                    for key in ("free_limits", "quota_type", "resolution", "formats", "watermark"):
+                        v = data.get(key)
+                        if v and v != "не указано":
+                            it[key] = v
+                    for key in ("modes", "models"):
+                        if data.get(key):
+                            it[key] = data[key]
+                    if data.get("card_required") == "нет":
+                        notes.append("Привязка карты не требуется.")
+                    elif data.get("card_required") == "да":
+                        notes.append("Требуется привязка карты.")
+                    if data.get("russia") and data["russia"] != "не указано":
+                        notes.append(f"Доступность в РФ: {data['russia']}.")
+                    if data.get("free_access") == "нет":
+                        notes.append("На сайте бесплатный доступ не обнаружен.")
+                    verified = True
+        except Exception as e:
+            print(f"   Проверка '{name}' не удалась: {e}")
+        notes.append("Условия проверены на официальном сайте." if verified else "Условия не проверены на сайте сервиса.")
+        it["notes"] = " ".join(n.strip() for n in notes if n)
 
 
 def esc(s: str) -> str:
@@ -406,6 +535,10 @@ def main() -> None:
     if not data.get("has_news") or not data.get("items"):
         print("Новостей, соответствующих критериям, не найдено.")
         return
+
+    data["items"] = data["items"][:6]
+    print("2.5 Проверка условий на сайтах сервисов...")
+    verify_items(data["items"])
 
     seen_domains = {s["domain"] for s in state["seen"]}
     data["items"] = [
