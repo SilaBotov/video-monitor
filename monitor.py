@@ -103,7 +103,7 @@ def domain(url: str) -> str:
 
 # Слова-мусор: такие результаты отбрасываем до отправки в модель
 JUNK_RE = re.compile(
-    r"\b(porn\w*|порно\w*|nsfw|hentai|хент\w*|sex|секс\w*|xxx|samsung|oneplus|oppo|смартфон\w*)\b",
+    r"\b(porn\w*|порно\w*|nsfw|hentai|хент\w*|sex|секс\w*|xxx|samsung|oneplus|oppo|смартфон\w*|trademarks?|товарн\w+\s+знак\w*)\b",
     re.IGNORECASE,
 )
 
@@ -112,18 +112,33 @@ def is_junk(title: str, snippet: str = "") -> bool:
     return bool(JUNK_RE.search(f"{title} {snippet}"))
 
 
+VIDEO_RE = re.compile(
+    r"video|видео|ролик|clip|анимац|animat|генерац|generat|sora|veo|kling|seedance|runway|firefly|omni",
+    re.IGNORECASE,
+)
+
+
+def is_relevant(title: str, snippet: str = "") -> bool:
+    """Оставляем только материалы, где вообще речь о видео или генерации."""
+    return bool(VIDEO_RE.search(f"{title} {snippet}"))
+
+
 def clean_html(text: str) -> str:
     return BeautifulSoup(text or "", "html.parser").get_text(" ", strip=True)
 
 
 def resolve_google_link(link: str) -> str:
     """Google News отдаёт ссылки-редиректы. Пробуем получить настоящий адрес статьи."""
-    if "news.google.com" not in link or gnewsdecoder is None:
+    if "news.google.com" not in link:
+        return link
+    if gnewsdecoder is None:
+        print("   googlenewsdecoder не установлен: ссылки Google News не раскрываются")
         return link
     try:
         res = gnewsdecoder(link, interval=1)
         if res.get("status") and res.get("decoded_url"):
             return res["decoded_url"]
+        print(f"   Ссылка Google News не раскрыта: {str(res)[:150]}")
     except Exception as e:
         print(f"   Не удалось раскрыть ссылку Google News: {e}")
     return link
@@ -176,7 +191,7 @@ def search_and_parse() -> list[dict]:
             for entry in feed.entries[:5]:  # Берем топ-5 по каждому запросу
                 link = entry.get("link", "")
                 title = entry.get("title", "")
-                if not link or link in seen_urls or is_junk(title):
+                if not link or link in seen_urls or is_junk(title) or not is_relevant(title, clean_html(entry.get("summary", ""))):
                     continue
                 seen_urls.add(link)
                 real_link = resolve_google_link(link)
@@ -206,7 +221,8 @@ def search_and_parse() -> list[dict]:
                 hits = list(ddgs.news(q, max_results=5, timelimit="w"))
             for h in hits:
                 url = h.get("url", "")
-                if not url or url in seen_urls or is_junk(h.get("title", ""), h.get("body", "")):
+                if not url or url in seen_urls or is_junk(h.get("title", ""), h.get("body", "")) \
+                        or not is_relevant(h.get("title", ""), h.get("body", "")):
                     continue
                 seen_urls.add(url)
                 results.append({
@@ -231,7 +247,8 @@ def search_and_parse() -> list[dict]:
                 hits = list(ddgs.text(q, max_results=5, timelimit="m"))
             for h in hits:
                 url = h.get("href", "")
-                if not url or url in seen_urls or is_junk(h.get("title", ""), h.get("body", "")):
+                if not url or url in seen_urls or is_junk(h.get("title", ""), h.get("body", "")) \
+                        or not is_relevant(h.get("title", ""), h.get("body", "")):
                     continue
                 seen_urls.add(url)
                 results.append({
@@ -246,23 +263,9 @@ def search_and_parse() -> list[dict]:
 
     print(f"   Всего найдено уникальных ссылок: {len(results)}")
 
-    # 4. Парсим страницы (только первые 15 уникальных доменов, чтобы уложиться в лимиты времени GitHub)
-    parsed_domains = set()
-    parsed_count = 0
+    # Тексты статей не читаем: условия проверяет второй этап по официальным сайтам сервисов.
     for r in results:
-        if parsed_count >= 15:
-            r["page_text"] = ""
-            continue
-            
-        d = domain(r["url"])
-        if d in parsed_domains:
-            r["page_text"] = ""
-            continue
-            
-        parsed_domains.add(d)
-        parsed_count += 1
-        r["page_text"] = extract_page_text(r["url"])
-        time.sleep(0.5)
+        r["page_text"] = ""
 
     return results
 
@@ -315,7 +318,7 @@ def ask_groq(search_results: list[dict], seen: list[dict]) -> dict:
 {seen_text}
 
 Данные для анализа:
-{context[:8000]}
+{context[:9000]}
 
 Проанализируй данные и верни СТРОГО JSON согласно инструкции в системном промпте."""
 
@@ -357,22 +360,32 @@ def find_official_site(item: dict) -> str:
     if hint.startswith("http") and is_official_candidate(domain(hint)):
         p = urlparse(hint)
         return f"{p.scheme}://{p.netloc}"
-    words = re.findall(r"[A-Za-z0-9]+", item.get("name", ""))
+    name = item.get("name", "")
+    words = re.findall(r"[A-Za-z0-9]+", name)
     token = words[0].lower() if words else ""
     if len(token) < 3:
         return ""
-    try:
-        with DDGS() as ddgs:
-            hits = list(ddgs.text(f"{item.get('name', '')} AI video generator official site", max_results=8))
-    except Exception as e:
-        print(f"   Поиск сайта '{item.get('name')}' не удался: {e}")
-        return ""
-    for h in hits:
-        u = h.get("href", "")
-        host = domain(u)
-        if u and is_official_candidate(host) and token in host.replace("-", ""):
-            p = urlparse(u)
-            return f"{p.scheme}://{p.netloc}"
+    for q in (f"{name} official site", f"{name} pricing free credits", name):
+        try:
+            with DDGS() as ddgs:
+                hits = list(ddgs.text(q, max_results=8))
+        except Exception as e:
+            print(f"   Поиск сайта '{q}' не удался: {e}")
+            time.sleep(2)
+            continue
+        for h in hits:
+            u = h.get("href", "")
+            host = domain(u)
+            if u and is_official_candidate(host) and token in host.replace("-", ""):
+                p = urlparse(u)
+                return f"{p.scheme}://{p.netloc}"
+        time.sleep(1)
+    # запасной вариант: пробуем типичные адреса и проверяем, что на странице упомянуто название
+    for tld in (".com", ".ai", ".io", ".video", ".app"):
+        site = f"https://{token}{tld}"
+        text = extract_page_text(site, max_chars=1500)
+        if len(text) > 150 and token in text.lower():
+            return site
     return ""
 
 
@@ -536,14 +549,24 @@ def main() -> None:
         print("Новостей, соответствующих критериям, не найдено.")
         return
 
-    data["items"] = data["items"][:6]
+    seen_names = {s.get("name", "").strip().lower() for s in state["seen"]}
+    data["items"] = [
+        it for it in data["items"]
+        if it.get("change") == "updated" or it.get("name", "").strip().lower() not in seen_names
+    ][:6]
+    if not data["items"]:
+        print("Все найденные сервисы уже отправлялись ранее.")
+        return
     print("2.5 Проверка условий на сайтах сервисов...")
     verify_items(data["items"])
 
-    seen_domains = {s["domain"] for s in state["seen"]}
+    seen_domains = {s["domain"] for s in state["seen"] if is_official_candidate(s["domain"])}
     data["items"] = [
         it for it in data["items"]
-        if it.get("change") == "updated" or domain(it.get("url", "")) not in seen_domains
+        if it.get("change") == "updated" or (
+            domain(it.get("url", "")) not in seen_domains
+            and it.get("name", "").strip().lower() not in seen_names
+        )
     ]
 
     if not data["items"]:
