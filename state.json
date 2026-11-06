@@ -84,6 +84,16 @@
       "name": "Wireflow",
       "domain": "wireflow.ai",
       "date": "2026-11-06"
+    },
+    {
+      "name": "Palmier",
+      "domain": "palmier.io",
+      "date": "2026-11-06"
+    },
+    {
+      "name": "Gemini Omni 1.2 Flash",
+      "domain": "gemini-omni.dev",
+      "date": "2026-11-06"
     }
   ]
 }
