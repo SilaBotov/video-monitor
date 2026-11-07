@@ -27,6 +27,13 @@ from openai import OpenAI
 STATE_FILE = Path(__file__).with_name("state.json")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+# --dry-run: полный прогон, но без отправки в Telegram и без записи в state.json.
+DRY_RUN = "--dry-run" in sys.argv[1:] or os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+# Сколько последних записей истории хранить: state.json не должен расти бесконечно.
+MAX_SEEN = 1000
+# True: в отчёт попадают только карточки с измеримым бесплатным объёмом (кредиты, секунды, ролики).
+# False: достаточно подтверждённого бесплатного доступа — вернуть прежнее, более мягкое поведение.
+REQUIRE_FREE_VOLUME = True
 # False: сервисы, найденные только обычным веб-поиском (лендинги, каталоги, рейтинги), в пост не попадают.
 # Новостью считаются только материалы из Google News и новостного поиска DuckDuckGo. Поставь True, чтобы вернуть прежнее поведение.
 WEB_RESULTS_CAN_BE_NEWS = False
@@ -98,13 +105,35 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 }"""
 
 
+def dedupe_seen(entries: list) -> list:
+    """Убирает повторы: одна запись на пару (название, домен), позиция — по последнему появлению."""
+    merged: dict[tuple[str, str], dict] = {}
+    for e in entries or []:
+        if not isinstance(e, dict) or not str(e.get("name", "")).strip():
+            continue
+        key = (str(e["name"]).strip().lower(), str(e.get("domain", "")).strip().lower())
+        merged.pop(key, None)  # переставляем запись в конец, чтобы порядок отражал свежесть
+        merged[key] = e
+    return list(merged.values())
+
+
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {"seen": []}
+    if not STATE_FILE.exists():
+        return {"seen": []}
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        print(f"   state.json не читается ({e}): начинаю с пустой истории")
+        return {"seen": []}
+    if not isinstance(state, dict):
+        return {"seen": []}
+    seen = state.get("seen")
+    state["seen"] = dedupe_seen(seen if isinstance(seen, list) else [])[-MAX_SEEN:]
+    return state
 
 
 def save_state(state: dict) -> None:
+    state["seen"] = dedupe_seen(state.get("seen", []))[-MAX_SEEN:]
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -375,7 +404,7 @@ VERIFY_PROMPT = """Ты проверяешь условия бесплатног
 Бесплатным считай только то, что прямо названо бесплатным: бесплатный тариф (Free), пробный период, кредиты при регистрации. Платные тарифы с кредитами в месяц, цены и суммы в долларах бесплатным доступом НЕ являются. Если на сайте видны только платные тарифы, ставь free_access «нет».
 Верни СТРОГО один JSON-объект:
 {
-  "official_site": "да, если сайт принадлежит самому сервису или компании-разработчику; нет, если это сторонний сайт, фан-сайт, перепродавец чужих моделей, каталог или в тексте есть оговорка вроде «не аффилирован», «unofficial», «independent»",
+  "official_site": "да, если сайт принадлежит самому сервису или компании-разработчику; нет, если это сторонний сайт, фан-сайт, перепродавец чужих моделей, каталог или в тексте есть оговорка вроде «не аффилирован», «unofficial», «independent». Ставь «нет», если сайт — агрегатор или витрина, которая предлагает чужие видеомодели (Veo, Kling, Sora, Seedance и т.п.) и не имеет собственной модели",
   "free_access": "да|нет|не указано",
   "free_limits": "бесплатные лимиты именно на ГЕНЕРАЦИЮ ВИДЕО: кредиты, секунды, генерации (кратко, по-русски). Если на сайте указаны лимиты только для изображений или текста, напиши «для видео не указано (для изображений: ...)»",
   "quota_type": "daily|monthly|trial|rolling|не указано",
@@ -570,12 +599,93 @@ def dedupe_models(models: list) -> list:
     return [m for m in out if not any(o.lower().startswith(m.lower() + " ") for o in out)]
 
 
+# ---------- Защита от мусорных карточек: деньги, «безлимит», текстовые модели, ложные обновления ----------
+
+# Суммы в деньгах не считаются бесплатными лимитами — их нельзя публиковать (см. системный промпт).
+MONEY_RE = re.compile(r"(?:\$|€|₽)\s?\d|\d[\d\s.,]*\s?(?:\$|€|₽|долл|usd|eur|руб)", re.IGNORECASE)
+# «Без ограничений» и «безлимит» разрешены, только если источник прямо об этом говорит; как правило это домысел.
+UNLIMITED_RE = re.compile(r"без\s+ограничен|безлимит|неограничен", re.IGNORECASE)
+# Текстовые модели не должны попадать в список видеомоделей.
+TEXT_MODEL_RE = re.compile(r"^\s*(gpt|chatgpt|claude|llama|mistral|deepseek|grok)\b", re.IGNORECASE)
+HAS_DIGIT_RE = re.compile(r"\d")
+NUMBER_WORD_RE = re.compile(
+    r"\b(один|одна|одно|одну|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)\b",
+    re.IGNORECASE,
+)
+
+
+def scrub_claims(text: str) -> str:
+    """Убирает суммы в деньгах и обещания безлимита: публиковать их нельзя."""
+    text = re.sub(r"\([^)]*(?:\$|€|₽)[^)]*\)", "", str(text or ""))
+    clauses = re.split(r"(?<=[.;])\s+", text)
+    kept = [c for c in clauses if c.strip() and not MONEY_RE.search(c) and not UNLIMITED_RE.search(c)]
+    cleaned = re.sub(r"\s{2,}", " ", " ".join(kept)).strip()
+    return cleaned.strip(" ,;.")
+
+
+def sanitize_items(items: list[dict]) -> None:
+    """Чистит карточки до публикации: деньги, безлимит, текстовые модели."""
+    for it in items:
+        for key in ("free_limits", "what_changed", "notes"):
+            if it.get(key):
+                it[key] = scrub_claims(it[key])
+        if "models" in it:
+            it["models"] = [m for m in as_list(it.get("models")) if not TEXT_MODEL_RE.search(m)]
+
+
+def has_volume(it: dict) -> bool:
+    """Есть ли у бесплатного доступа измеримый объём: кредиты, секунды, ролики, генерации."""
+    lim = str(it.get("free_limits", "")).strip()
+    if not lim or "не указан" in lim.lower():
+        return False
+    return bool(HAS_DIGIT_RE.search(lim) or NUMBER_WORD_RE.search(lim) or UNLIMITED_RE.search(lim))
+
+
+def update_signature(it: dict) -> dict:
+    """Отпечаток условий сервиса: числа из лимитов + видеомодели.
+
+    Нужен, чтобы отличить реальное изменение условий от пересказа того же самого.
+    """
+    nums = sorted(set(re.findall(r"\d+(?:[.,]\d+)?", str(it.get("free_limits", "")))))
+    models = sorted({m.strip().lower() for m in as_list(it.get("models"))})
+    return {"nums": nums, "models": models}
+
+
+def filter_unconfirmed_updates(items: list[dict], seen: list[dict]) -> tuple[list[dict], list[str]]:
+    """change=updated пропускаем, только если условия отличаются от прошлой отправки."""
+    prev_by_name = {
+        str(s.get("name", "")).strip().lower(): s
+        for s in seen
+        if isinstance(s, dict) and str(s.get("name", "")).strip()
+    }
+    kept, dropped = [], []
+    for it in items:
+        if it.get("change") != "updated":
+            kept.append(it)
+            continue
+        prev = prev_by_name.get(str(it.get("name", "")).strip().lower())
+        if prev is None:
+            it["change"] = "new"  # сервис ещё не отправлялся — это не обновление
+            kept.append(it)
+            continue
+        if not prev.get("sig"):
+            kept.append(it)  # история без отпечатка: даём один шанс и запоминаем условия
+            continue
+        if prev["sig"] == update_signature(it):
+            dropped.append(it.get("name", "?"))
+            continue
+        kept.append(it)
+    return kept, dropped
+
+
 def has_data(it: dict) -> bool:
-    """Публикуем только то, что подтверждено на официальном сайте как бесплатное."""
+    """Публикуем только то, что подтверждено на официальном сайте и имеет измеримый объём."""
     if not it.get("_verified"):
         return False
     if str(it.get("free_access", "")).strip().lower() == "нет":
         return False
+    if REQUIRE_FREE_VOLUME:
+        return has_volume(it)
     for k in ("free_limits", "quota_type"):
         if str(it.get(k, "")).strip().lower() not in ("", "не указано", "для видео не указано"):
             return True
@@ -777,6 +887,12 @@ def send_telegram(text: str) -> None:
 
 def main() -> None:
     print("Запуск мониторинга...")
+    if not os.environ.get("GROQ_API_KEY"):
+        sys.exit("Не задан GROQ_API_KEY: добавь его в Secrets репозитория (Settings → Secrets and variables → Actions).")
+    if not DRY_RUN and not (os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")):
+        sys.exit("Не заданы TELEGRAM_BOT_TOKEN и/или TELEGRAM_CHAT_ID: добавь их в Secrets репозитория.")
+    if DRY_RUN:
+        print("   Режим --dry-run: сообщение будет только напечатано, state.json не изменится.")
     state = load_state()
 
     print("1. Поиск и парсинг страниц...")
@@ -798,6 +914,7 @@ def main() -> None:
             dropped = [it.get("name", "?") for it in data["items"] if it.get("url") in web_urls]
             print(f"   Отсеяны сервисы, найденные только справочными страницами: {', '.join(dropped)}")
         data["items"] = kept
+    sanitize_items(data.get("items", []))
     if not data.get("has_news") or not data.get("items"):
         print("Новостей, соответствующих критериям, не найдено.")
         return
@@ -813,7 +930,7 @@ def main() -> None:
         data["items"] = [it for it in data["items"] if not (it.get("change") == "updated" and not str(it.get("what_changed", "")).strip())]
     data["items"] = data["items"][:6]
     if not data["items"]:
-        print("Все найденные сервисы уже отправлялись ранее.")
+        print("Не осталось карточек для публикации.")
         return
     print("2.5 Проверка условий на сайтах сервисов...")
     verify_items(data["items"])
@@ -827,6 +944,9 @@ def main() -> None:
         )
     ]
 
+    data["items"], unconfirmed = filter_unconfirmed_updates(data["items"], state["seen"])
+    if unconfirmed:
+        print(f"   Пропущены повторные «обновления» без изменений в лимитах и моделях: {', '.join(unconfirmed)}")
     if not data["items"]:
         print("Все найденные сервисы уже отправлялись ранее.")
         return
@@ -843,7 +963,14 @@ def main() -> None:
     rewrite_report(data)
 
     print("3. Отправка в Telegram...")
-    send_telegram(format_message(data))
+    message = format_message(data)
+    if DRY_RUN:
+        print("\n---------- ЧЕРНОВИК СООБЩЕНИЯ (не отправлено) ----------\n")
+        print(message)
+        print("\n--------------------- КОНЕЦ ЧЕРНОВИКА ---------------------")
+        print("Dry-run завершён: Telegram и state.json не тронуты.")
+        return
+    send_telegram(message)
 
     today = datetime.now().strftime("%Y-%m-%d")
     for it in data["items"]:
@@ -851,6 +978,7 @@ def main() -> None:
             "name": it.get("name", ""),
             "domain": domain(it.get("url", "")),
             "date": today,
+            "sig": update_signature(it),
         })
     save_state(state)
     print(f"Успешно отправлено позиций: {len(data['items'])}")
