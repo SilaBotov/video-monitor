@@ -556,33 +556,53 @@ def verify_items(items: list[dict]) -> None:
         old_notes = it.get("notes", "")
         notes = []
         verified = False
+        reject = ""
         try:
             site = find_official_site(it)
             if not site:
                 print(f"   {name}: официальный сайт не найден")
+                reject = "официальный сайт не найден"
             else:
                 text = fetch_site_texts(site)
                 print(f"   {name}: сайт {site}, прочитано {len(text)} символов")
                 if len(text) < 300:
                     print(f"   {name}: мало текста (возможно, страница грузится скриптами)")
                     it["url"] = site
+                    reject = "сайт не отдал текст (возможно, нужен браузер)"
                 else:
                     data = call_groq(VERIFY_PROMPT, f"Сервис: {name}\nСайт: {site}\n\n{text[:7000]}", 1500)
                     time.sleep(3)
                     if str(data.get("official_site", "да")).strip().lower().startswith("нет"):
                         print(f"   {name}: {site} похож на неофициальный сайт, данные с него не используются")
+                        reject = "сайт не официальный (агрегатор, каталог или перепродажа)"
                     else:
                         it["url"] = site
                         merge_site_data(it, data, notes)
                         verified = True
         except Exception as e:
             print(f"   Проверка '{name}' не удалась: {e}")
+            reject = "ошибка при проверке сайта"
         if not verified and old_notes:
             notes = [old_notes] + notes
         # если сайт проверен, заметка первого этапа могла противоречить данным сайта, поэтому берём только данные сайта
         it["notes"] = " ".join(n.strip() for n in notes if n)
         # флаг для has_data: без подтверждения на официальном сайте карточку не публикуем
         it["_verified"] = verified
+        if reject:
+            it["_reject"] = reject
+        else:
+            it.pop("_reject", None)
+
+
+def rejection_reason(it: dict) -> str:
+    """Короткая причина, по которой карточка не попала в отчёт."""
+    if not it.get("_verified"):
+        return it.get("_reject") or "официальный сайт не подтверждён"
+    if str(it.get("free_access", "")).strip().lower() == "нет":
+        return "на сайте нет бесплатного доступа"
+    if REQUIRE_FREE_VOLUME and not has_volume(it):
+        return "бесплатный доступ есть, но объём не указан (нет цифр)"
+    return "нет подтверждённых данных"
 
 
 ALLOWED_MODES = {"image-to-video", "start & end frame", "липсинк", "нативный звук", "consistent characters", "text-to-video"}
@@ -746,7 +766,7 @@ def rewrite_report(data: dict) -> None:
     try:
         slim = []
         for it in data.get("items", []):
-            d = {k: v for k, v in it.items() if k not in ("notes", "official_url", "url", "access_type", "_verified")}
+            d = {k: v for k, v in it.items() if k not in ("notes", "official_url", "url", "access_type") and not k.startswith("_")}
             d = {k: v for k, v in d.items() if v not in ("не указано", "", [], None)}
             notes = it.get("notes", "").strip()
             if notes:
@@ -952,9 +972,11 @@ def main() -> None:
         return
 
     translate_items(data["items"])
-    empty = [it.get("name", "?") for it in data["items"] if not has_data(it)]
+    empty = [(it.get("name", "?"), rejection_reason(it)) for it in data["items"] if not has_data(it)]
     if empty:
-        print(f"   Пропущены сервисы без подтверждённого бесплатного доступа на официальном сайте: {', '.join(empty)}")
+        print("   Пропущены карточки:")
+        for name, why in empty:
+            print(f"     - {name}: {why}")
         data["items"] = [it for it in data["items"] if has_data(it)]
     if not data["items"]:
         print("Нет сервисов с подтверждёнными данными для публикации.")
