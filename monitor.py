@@ -344,6 +344,74 @@ def search_and_parse() -> list[dict]:
     return results
 
 
+# ---------- Площадки запусков: Hacker News и Product Hunt (не зависят от Google News) ----------
+
+LAUNCH_BOARD_RE = re.compile(r"^\s*(?:Show|Launch)\s+HN:\s*(.+)$", re.IGNORECASE)
+
+
+def _board_item(name: str, url: str, why: str):
+    name = name.strip(" -–—:|\"'")
+    if not name or len(name) > 40 or len(name.split()) > 4:
+        return None
+    if url and not (url.startswith("http") and is_official_candidate(domain(url))):
+        url = ""
+    return {
+        "name": name, "url": url, "official_url": url, "change": "new", "access_type": "free",
+        "notes": "", "modes": [], "models": [], "_gemini": True, "_why": why,
+    }
+
+
+def hn_candidates() -> list[dict]:
+    """Show HN / Launch HN про ИИ-видео за последние 7 дней (бесплатный поиск Algolia по Hacker News)."""
+    since = int(time.time()) - 7 * 86400
+    out = []
+    for q in ("AI video generator", "text to video", "video generation"):
+        try:
+            r = requests.get(
+                "https://hn.algolia.com/api/v1/search_by_date",
+                params={"query": q, "tags": "story", "numericFilters": f"created_at_i>{since}", "hitsPerPage": 20},
+                timeout=20,
+            )
+            r.raise_for_status()
+            hits = r.json().get("hits", [])
+        except Exception as e:
+            print(f"   Hacker News '{q}': не удалось ({' '.join(str(e).split())[:120]})")
+            continue
+        print(f"   Hacker News '{q}': записей {len(hits)}")
+        for h in hits:
+            title = h.get("title") or ""
+            m = LAUNCH_BOARD_RE.match(title)
+            if not m or is_junk(title) or not is_relevant(title):
+                continue
+            head = re.split(r"\s[–—-]\s|:\s|\s\|\s|\(", m.group(1), maxsplit=1)[0]
+            item = _board_item(head, h.get("url") or "", f"Hacker News: {title[:90]}")
+            if item:
+                out.append(item)
+        time.sleep(1)
+    return out
+
+
+def producthunt_candidates() -> list[dict]:
+    """Свежие запуски Product Hunt (RSS), где речь об ИИ и видео."""
+    try:
+        feed = feedparser.parse("https://www.producthunt.com/feed")
+    except Exception as e:
+        print(f"   Product Hunt: не удалось ({' '.join(str(e).split())[:120]})")
+        return []
+    print(f"   Product Hunt: записей {len(feed.entries)}")
+    out = []
+    for e in feed.entries:
+        title = e.get("title", "")
+        text = f"{title} {clean_html(e.get('summary', ''))}"
+        if is_junk(text) or not re.search(r"video|видео", text, re.IGNORECASE) or not re.search(r"\bAI\b|ИИ|нейро", text):
+            continue
+        head = re.split(r"\s[–—-]\s|:\s", title, maxsplit=1)[0]
+        item = _board_item(head, "", f"Product Hunt: {title[:90]}")
+        if item:
+            out.append(item)
+    return out
+
+
 LAUNCH_RE = re.compile(
     r"launch|unveil|introduc|\badds?\b|\badded\b|rolls? out|rebrand|free tier|free plan|free credits|now free|бесплатн|запуст|запуск|представ|добав|открыл",
     re.IGNORECASE,
@@ -395,7 +463,7 @@ def web_search_candidates(seen: list[dict]) -> list[dict]:
     client = OpenAI(base_url=GROQ_BASE_URL, api_key=os.environ["GROQ_API_KEY"])
     prompt = SEARCH_PROMPT.replace("{today}", datetime.now().strftime("%Y-%m-%d"))
     text = ""
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             resp = client.chat.completions.create(
                 model=GROQ_MODEL,
@@ -410,9 +478,10 @@ def web_search_candidates(seen: list[dict]) -> list[dict]:
             break
         except Exception as e:
             msg = " ".join(str(e).split())[:300]
-            if attempt == 0 and "429" in msg:
-                print("   Поиск Groq: лимит, жду 40 секунд и повторяю...")
-                time.sleep(40)
+            if attempt < 2 and ("429" in msg or "Parsing failed" in msg):
+                wait = 40 if "429" in msg else 5
+                print(f"   Поиск Groq: сбой ({msg[:80]}), попытка {attempt + 2} из 3 через {wait} с...")
+                time.sleep(wait)
                 continue
             print(f"   Поиск Groq: ошибка: {msg}")
             return []
@@ -1077,6 +1146,23 @@ def main() -> None:
     if gem:
         data["has_news"] = True
         data["items"].extend(gem)
+    print("2.3 Площадки запусков (Hacker News, Product Hunt)...")
+    taken = {it.get("name", "").strip().lower() for it in data["items"]} | {
+        str(x.get("name", "")).strip().lower() for x in state["seen"] if isinstance(x, dict)
+    }
+    boards, picked = [], set()
+    for c in hn_candidates() + producthunt_candidates():
+        low = c["name"].strip().lower()
+        if low in taken or low in picked:
+            continue
+        picked.add(low)
+        boards.append(c)
+    boards = boards[:4]
+    for c in boards:
+        print(f"   Площадки: кандидат {c['name']} | {c['url'] or 'адрес не указан'} | {c['_why']}")
+    if boards:
+        data["has_news"] = True
+        data["items"].extend(boards)
     if not data["items"]:
         print("Новостей, соответствующих критериям, не найдено.")
         return
@@ -1090,7 +1176,7 @@ def main() -> None:
     if no_reason:
         print(f"   Пропущены обновления без описания изменения: {', '.join(no_reason)}")
         data["items"] = [it for it in data["items"] if not (it.get("change") == "updated" and not str(it.get("what_changed", "")).strip())]
-    data["items"] = data["items"][:6]
+    data["items"] = data["items"][:8]
     if not data["items"]:
         print("Не осталось карточек для публикации.")
         return
