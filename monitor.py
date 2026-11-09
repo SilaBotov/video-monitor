@@ -37,6 +37,9 @@ REQUIRE_FREE_VOLUME = True
 # False: сервисы, найденные только обычным веб-поиском (лендинги, каталоги, рейтинги), в пост не попадают.
 # Новостью считаются только материалы из Google News и новостного поиска DuckDuckGo. Поставь True, чтобы вернуть прежнее поведение.
 WEB_RESULTS_CAN_BE_NEWS = False
+# Gemini с поиском Google ищет кандидатов (названия и сайты). Условия по-прежнему проверяются по официальному сайту.
+# Модель можно сменить переменной GEMINI_MODEL. Если ключа нет или Gemini отвечает ошибкой, шаг просто пропускается.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 SYSTEM_PROMPT = """Ты — аналитик рынка веб-генераторов видео на основе ИИ.
 Задача: по предоставленным данным (результаты поиска и тексты страниц) составить отчёт о НОВЫХ платформах и ЗАМЕТНЫХ изменениях условий. Пиши на русском языке.
@@ -247,11 +250,16 @@ def search_and_parse() -> list[dict]:
         "AI video generator rebrand",
         "AI video generator launches free credits sign up",
         "AI video studio launch free trial",
+        "unveils AI video generation platform",
+        "launches AI video generator free credits",
+        "new Seedance Kling Veo version free",
+        "ByteDance AI video platform launch",
     ]
     for q in news_queries:
         try:
             url = f"https://news.google.com/rss/search?q={requests.utils.quote(q + ' when:7d')}&hl=ru&gl=RU&ceid=RU:ru"
             feed = feedparser.parse(url)
+            print(f"   Google News '{q[:45]}': записей {len(feed.entries)}")
             for entry in feed.entries[:5]:  # Берем топ-5 по каждому запросу
                 link = entry.get("link", "")
                 title = entry.get("title", "")
@@ -332,6 +340,72 @@ def search_and_parse() -> list[dict]:
         r["page_text"] = ""
 
     return results
+
+
+GEMINI_PROMPT = """Today is {today}. Use Google Search. List AI video generation web platforms that work directly in a browser and that LAUNCHED, REBRANDED or CHANGED THEIR FREE PLAN / FREE CREDITS during the last 7 days.
+Rules:
+- Only services with a free plan, free trial or free sign-up credits. Skip paid-only services, Discord or Telegram bots, rankings, reviews and roundups.
+- official_url must be the service's OWN website (not a news article, catalog or social network). If you are not sure about the address, leave it empty.
+- Do not invent services. If you found nothing reliable, return an empty list.
+- Do not describe limits or prices: only the name, the official site and a short reason.
+Return ONLY a JSON object, no markdown:
+{"services": [{"name": "...", "official_url": "https://...", "why": "one short sentence: launch, rebrand or free plan change"}]}
+Return at most 8 services."""
+
+
+def gemini_candidates(seen: list[dict]) -> list[dict]:
+    """Спрашивает Gemini (с поиском Google) о новых сервисах. Берём только названия и адреса сайтов."""
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        print("   Gemini: GEMINI_API_KEY не задан, шаг пропущен")
+        return []
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": GEMINI_PROMPT.replace("{today}", datetime.now().strftime("%Y-%m-%d"))}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.1},
+    }
+    try:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json=body,
+            timeout=120,
+        )
+    except Exception as e:
+        print(f"   Gemini: запрос не удался: {e}")
+        return []
+    if r.status_code != 200:
+        print(f"   Gemini: ответ {r.status_code}: {r.text[:400]}")
+        return []
+    try:
+        parts = r.json()["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        services = json.loads(match.group(0)).get("services", [])
+    except Exception as e:
+        print(f"   Gemini: не удалось разобрать ответ ({e}): {r.text[:400]}")
+        return []
+    seen_names = {str(s.get("name", "")).strip().lower() for s in seen if isinstance(s, dict)}
+    out = []
+    for sv in services if isinstance(services, list) else []:
+        if not isinstance(sv, dict):
+            continue
+        name = str(sv.get("name", "")).strip()
+        url = str(sv.get("official_url", "")).strip()
+        if not name:
+            continue
+        if name.lower() in seen_names:
+            print(f"   Gemini: {name} уже отправлялся, пропускаю")
+            continue
+        if url and not (url.startswith("http") and is_official_candidate(domain(url))):
+            url = ""
+        out.append({
+            "name": name, "url": url, "official_url": url, "change": "new", "access_type": "free",
+            "notes": "", "modes": [], "models": [], "_gemini": True,
+        })
+        print(f"   Gemini: кандидат {name} | {url or 'адрес не указан'} | {str(sv.get('why', ''))[:100]}")
+    print(f"   Gemini: кандидатов {len(out)}")
+    return out
 
 
 def call_groq(system: str, user: str, max_tokens: int = 4000) -> dict:
@@ -450,6 +524,11 @@ def find_site_by_search(item: dict) -> str:
     words = re.findall(r"[A-Za-z0-9]+", name)
     token = words[0].lower() if words else ""
     hint = item.get("official_url") or ""
+    if item.get("_gemini") and hint.startswith("http") and is_official_candidate(domain(hint)):
+        p = urlparse(hint)
+        path = "/".join(seg for seg in p.path.split("/") if seg)
+        path = path.split("/")[0]
+        return f"{p.scheme}://{p.netloc}" + (f"/{path}" if path else "")
     if hint.startswith("http") and is_official_candidate(domain(hint)) and (not token or token in domain(hint).replace("-", "")):
         p = urlparse(hint)
         return f"{p.scheme}://{p.netloc}"
@@ -935,7 +1014,16 @@ def main() -> None:
             print(f"   Отсеяны сервисы, найденные только справочными страницами: {', '.join(dropped)}")
         data["items"] = kept
     sanitize_items(data.get("items", []))
-    if not data.get("has_news") or not data.get("items"):
+    if not data.get("has_news"):
+        data["items"] = []
+    data["items"] = data.get("items") or []
+    print("2.2 Кандидаты от Gemini...")
+    have = {it.get("name", "").strip().lower() for it in data["items"]}
+    gem = [c for c in gemini_candidates(state["seen"]) if c["name"].strip().lower() not in have]
+    if gem:
+        data["has_news"] = True
+        data["items"].extend(gem)
+    if not data["items"]:
         print("Новостей, соответствующих критериям, не найдено.")
         return
 
