@@ -39,7 +39,7 @@ REQUIRE_FREE_VOLUME = True
 WEB_RESULTS_CAN_BE_NEWS = False
 # Gemini с поиском Google ищет кандидатов (названия и сайты). Условия по-прежнему проверяются по официальному сайту.
 # Модели перебираются по порядку (можно задать переменной GEMINI_MODEL через запятую). Если ключа нет или Gemini отвечает ошибкой, шаг просто пропускается.
-GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODEL", "gemini-2.5-flash,gemini-flash-latest").split(",") if m.strip()]
+GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite,gemini-2.0-flash,gemini-2.5-pro").split(",") if m.strip()]
 
 SYSTEM_PROMPT = """Ты — аналитик рынка веб-генераторов видео на основе ИИ.
 Задача: по предоставленным данным (результаты поиска и тексты страниц) составить отчёт о НОВЫХ платформах и ЗАМЕТНЫХ изменениях условий. Пиши на русском языке.
