@@ -38,8 +38,8 @@ REQUIRE_FREE_VOLUME = True
 # Новостью считаются только материалы из Google News и новостного поиска DuckDuckGo. Поставь True, чтобы вернуть прежнее поведение.
 WEB_RESULTS_CAN_BE_NEWS = False
 # Gemini с поиском Google ищет кандидатов (названия и сайты). Условия по-прежнему проверяются по официальному сайту.
-# Модель можно сменить переменной GEMINI_MODEL. Если ключа нет или Gemini отвечает ошибкой, шаг просто пропускается.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+# Модели перебираются по порядку (можно задать переменной GEMINI_MODEL через запятую). Если ключа нет или Gemini отвечает ошибкой, шаг просто пропускается.
+GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODEL", "gemini-2.5-flash,gemini-flash-latest").split(",") if m.strip()]
 
 SYSTEM_PROMPT = """Ты — аналитик рынка веб-генераторов видео на основе ИИ.
 Задача: по предоставленным данным (результаты поиска и тексты страниц) составить отчёт о НОВЫХ платформах и ЗАМЕТНЫХ изменениях условий. Пиши на русском языке.
@@ -259,7 +259,10 @@ def search_and_parse() -> list[dict]:
         try:
             url = f"https://news.google.com/rss/search?q={requests.utils.quote(q + ' when:7d')}&hl=ru&gl=RU&ceid=RU:ru"
             feed = feedparser.parse(url)
-            print(f"   Google News '{q[:45]}': записей {len(feed.entries)}")
+            if not feed.entries:
+                time.sleep(3)
+                feed = feedparser.parse(url)
+            print(f"   Google News '{q[:45]}': записей {len(feed.entries)} (HTTP {getattr(feed, 'status', '?')}, ошибка разбора: {bool(getattr(feed, 'bozo', 0))})")
             for entry in feed.entries[:5]:  # Берем топ-5 по каждому запросу
                 link = entry.get("link", "")
                 title = entry.get("title", "")
@@ -276,7 +279,7 @@ def search_and_parse() -> list[dict]:
                     "url": real_link,
                     "source": "google_news",
                 })
-            time.sleep(0.5)
+            time.sleep(2.5)
         except Exception as e:
             print(f"Ошибка Google News RSS '{q}': {e}")
 
@@ -364,18 +367,24 @@ def gemini_candidates(seen: list[dict]) -> list[dict]:
         "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.1},
     }
-    try:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-            json=body,
-            timeout=120,
-        )
-    except Exception as e:
-        print(f"   Gemini: запрос не удался: {e}")
-        return []
-    if r.status_code != 200:
-        print(f"   Gemini: ответ {r.status_code}: {r.text[:400]}")
+    r = None
+    for model in GEMINI_MODELS:
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                json=body,
+                timeout=120,
+            )
+        except Exception as e:
+            print(f"   Gemini: модель {model}, запрос не удался: {e}")
+            continue
+        if resp.status_code == 200:
+            print(f"   Gemini: отвечает модель {model}")
+            r = resp
+            break
+        print(f"   Gemini: модель {model}, ответ {resp.status_code}: {' '.join(resp.text[:300].split())}")
+    if r is None:
         return []
     try:
         parts = r.json()["candidates"][0]["content"]["parts"]
@@ -1042,6 +1051,17 @@ def main() -> None:
         return
     print("2.5 Проверка условий на сайтах сервисов...")
     verify_items(data["items"])
+    for it in data["items"]:
+        wc = str(it.get("what_changed", ""))
+        if it.get("change") == "updated" and it.get("_verified") and re.search(r"кредит|credit", wc, re.IGNORECASE):
+            norm = lambda t: {re.sub(r"[\s.,]", "", n) for n in re.findall(r"\d[\d\s.,]*\d|\d", str(t))}
+            if norm(wc) and not norm(wc) <= norm(it.get("free_limits", "")):
+                print(f"   {it.get('name', '?')}: числа про кредиты в описании изменения не подтверждены сайтом, описание отброшено")
+                it["what_changed"] = ""
+    data["items"] = [it for it in data["items"] if not (it.get("change") == "updated" and not str(it.get("what_changed", "")).strip())]
+    if not data["items"]:
+        print("После проверки на сайтах не осталось подтверждённых обновлений.")
+        return
 
     seen_domains = {s["domain"] for s in state["seen"] if is_official_candidate(s["domain"])}
     data["items"] = [
