@@ -37,9 +37,8 @@ REQUIRE_FREE_VOLUME = True
 # False: сервисы, найденные только обычным веб-поиском (лендинги, каталоги, рейтинги), в пост не попадают.
 # Новостью считаются только материалы из Google News и новостного поиска DuckDuckGo. Поставь True, чтобы вернуть прежнее поведение.
 WEB_RESULTS_CAN_BE_NEWS = False
-# Gemini с поиском Google ищет кандидатов (названия и сайты). Условия по-прежнему проверяются по официальному сайту.
-# Модели перебираются по порядку (можно задать переменной GEMINI_MODEL через запятую). Если ключа нет или Gemini отвечает ошибкой, шаг просто пропускается.
-GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite,gemini-2.0-flash,gemini-2.5-pro").split(",") if m.strip()]
+# Поиск кандидатов встроенным веб-поиском Groq (browser_search у моделей gpt-oss): названия и сайты новых сервисов.
+# Условия по-прежнему проверяются только по официальным сайтам. При ошибке шаг пропускается.
 
 SYSTEM_PROMPT = """Ты — аналитик рынка веб-генераторов видео на основе ИИ.
 Задача: по предоставленным данным (результаты поиска и тексты страниц) составить отчёт о НОВЫХ платформах и ЗАМЕТНЫХ изменениях условий. Пиши на русском языке.
@@ -345,7 +344,7 @@ def search_and_parse() -> list[dict]:
     return results
 
 
-GEMINI_PROMPT = """Today is {today}. Use Google Search. List AI video generation web platforms that work directly in a browser and that LAUNCHED, REBRANDED or CHANGED THEIR FREE PLAN / FREE CREDITS during the last 7 days.
+SEARCH_PROMPT = """Today is {today}. Search the web. List AI video generation web platforms that work directly in a browser and that LAUNCHED, REBRANDED or CHANGED THEIR FREE PLAN / FREE CREDITS during the last 7 days.
 Rules:
 - Only services with a free plan, free trial or free sign-up credits. Skip paid-only services, Discord or Telegram bots, rankings, reviews and roundups.
 - official_url must be the service's OWN website (not a news article, catalog or social network). If you are not sure about the address, leave it empty.
@@ -356,43 +355,37 @@ Return ONLY a JSON object, no markdown:
 Return at most 8 services."""
 
 
-def gemini_candidates(seen: list[dict]) -> list[dict]:
-    """Спрашивает Gemini (с поиском Google) о новых сервисах. Берём только названия и адреса сайтов."""
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not key:
-        print("   Gemini: GEMINI_API_KEY не задан, шаг пропущен")
-        return []
-    body = {
-        "contents": [{"role": "user", "parts": [{"text": GEMINI_PROMPT.replace("{today}", datetime.now().strftime("%Y-%m-%d"))}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.1},
-    }
-    r = None
-    for model in GEMINI_MODELS:
+def web_search_candidates(seen: list[dict]) -> list[dict]:
+    """Просит Groq (gpt-oss с встроенным веб-поиском) назвать новые сервисы. Берём только названия и адреса сайтов."""
+    client = OpenAI(base_url=GROQ_BASE_URL, api_key=os.environ["GROQ_API_KEY"])
+    prompt = SEARCH_PROMPT.replace("{today}", datetime.now().strftime("%Y-%m-%d"))
+    text = ""
+    for attempt in range(2):
         try:
-            resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                json=body,
-                timeout=120,
+            resp = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[{"type": "browser_search"}],
+                tool_choice="required",
+                temperature=0.1,
+                max_tokens=3000,
+                extra_body={"reasoning_effort": "low"},
             )
-        except Exception as e:
-            print(f"   Gemini: модель {model}, запрос не удался: {e}")
-            continue
-        if resp.status_code == 200:
-            print(f"   Gemini: отвечает модель {model}")
-            r = resp
+            text = resp.choices[0].message.content or ""
             break
-        print(f"   Gemini: модель {model}, ответ {resp.status_code}: {' '.join(resp.text[:300].split())}")
-    if r is None:
-        return []
+        except Exception as e:
+            msg = " ".join(str(e).split())[:300]
+            if attempt == 0 and "429" in msg:
+                print("   Поиск Groq: лимит, жду 40 секунд и повторяю...")
+                time.sleep(40)
+                continue
+            print(f"   Поиск Groq: ошибка: {msg}")
+            return []
     try:
-        parts = r.json()["candidates"][0]["content"]["parts"]
-        text = "".join(p.get("text", "") for p in parts)
         match = re.search(r"\{.*\}", text, re.DOTALL)
         services = json.loads(match.group(0)).get("services", [])
     except Exception as e:
-        print(f"   Gemini: не удалось разобрать ответ ({e}): {r.text[:400]}")
+        print(f"   Поиск Groq: не удалось разобрать ответ ({e}): {' '.join(text[:300].split())}")
         return []
     seen_names = {str(s.get("name", "")).strip().lower() for s in seen if isinstance(s, dict)}
     out = []
@@ -404,7 +397,7 @@ def gemini_candidates(seen: list[dict]) -> list[dict]:
         if not name:
             continue
         if name.lower() in seen_names:
-            print(f"   Gemini: {name} уже отправлялся, пропускаю")
+            print(f"   Поиск Groq: {name} уже отправлялся, пропускаю")
             continue
         if url and not (url.startswith("http") and is_official_candidate(domain(url))):
             url = ""
@@ -412,8 +405,8 @@ def gemini_candidates(seen: list[dict]) -> list[dict]:
             "name": name, "url": url, "official_url": url, "change": "new", "access_type": "free",
             "notes": "", "modes": [], "models": [], "_gemini": True,
         })
-        print(f"   Gemini: кандидат {name} | {url or 'адрес не указан'} | {str(sv.get('why', ''))[:100]}")
-    print(f"   Gemini: кандидатов {len(out)}")
+        print(f"   Поиск Groq: кандидат {name} | {url or 'адрес не указан'} | {str(sv.get('why', ''))[:100]}")
+    print(f"   Поиск Groq: кандидатов {len(out)}")
     return out
 
 
@@ -1026,9 +1019,9 @@ def main() -> None:
     if not data.get("has_news"):
         data["items"] = []
     data["items"] = data.get("items") or []
-    print("2.2 Кандидаты от Gemini...")
+    print("2.2 Поиск кандидатов встроенным поиском Groq...")
     have = {it.get("name", "").strip().lower() for it in data["items"]}
-    gem = [c for c in gemini_candidates(state["seen"]) if c["name"].strip().lower() not in have]
+    gem = [c for c in web_search_candidates(state["seen"]) if c["name"].strip().lower() not in have]
     if gem:
         data["has_news"] = True
         data["items"].extend(gem)
