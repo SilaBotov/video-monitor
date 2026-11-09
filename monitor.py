@@ -344,6 +344,41 @@ def search_and_parse() -> list[dict]:
     return results
 
 
+LAUNCH_RE = re.compile(
+    r"launch|unveil|introduc|\badds?\b|\badded\b|rolls? out|rebrand|free tier|free plan|free credits|now free|бесплатн|запуст|запуск|представ|добав|открыл",
+    re.IGNORECASE,
+)
+ROUNDUP_RE = re.compile(
+    r"\bbest\b|\btop\b|\bvs\b|review|how to|guide|лучш|топ-?\d|обзор|сравнен|как создать|руководство",
+    re.IGNORECASE,
+)
+
+
+def corroborate_by_news(name: str) -> str:
+    """Ищет свежую новость именно про этот сервис (название в заголовке + слова о запуске или бесплатных условиях).
+    Возвращает заголовок или пустую строку."""
+    low = name.strip().lower()
+    titles = []
+    try:
+        url = f"https://news.google.com/rss/search?q={requests.utils.quote(name + ' free AI video when:14d')}&hl=en-US&gl=US&ceid=US:en"
+        feed = feedparser.parse(url)
+        titles += [e.get("title", "") for e in feed.entries[:10]]
+    except Exception as e:
+        print(f"   Новости про {name}: Google News не ответил ({e})")
+    time.sleep(2)
+    try:
+        with DDGS() as ddgs:
+            hits = ddg_call(ddgs.news, f"{name} free AI video", "m")
+        titles += [h.get("title", "") for h in hits]
+    except Exception as e:
+        print(f"   Новости про {name}: DuckDuckGo не ответил ({e})")
+    time.sleep(1)
+    for t in titles:
+        if low in t.lower() and LAUNCH_RE.search(t) and not ROUNDUP_RE.search(t):
+            return t
+    return ""
+
+
 SEARCH_PROMPT = """Today is {today}. Search the web. List AI video generation web platforms that work directly in a browser and that LAUNCHED, REBRANDED or CHANGED THEIR FREE PLAN / FREE CREDITS during the last 7 days.
 Rules:
 - Only services with a free plan, free trial or free sign-up credits. Skip paid-only services, Discord or Telegram bots, rankings, reviews and roundups.
@@ -1022,7 +1057,7 @@ def main() -> None:
     data["items"] = data.get("items") or []
     print("2.2 Поиск кандидатов встроенным поиском Groq...")
     have = {it.get("name", "").strip().lower() for it in data["items"]}
-    # Кандидат от поиска принимается, только если его название встречается в новостях первого этапа (Google News, DuckDuckGo News).
+    # Кандидат от поиска принимается, только если про него есть свежая новость: в результатах первого этапа или в отдельном поиске по его названию.
     news_text = " ".join(
         f"{r.get('title', '')} {r.get('snippet', '')}" for r in search_results if r.get("source") in ("google_news", "ddg_news")
     ).lower()
@@ -1032,8 +1067,11 @@ def main() -> None:
         if low in have:
             continue
         if low not in news_text:
-            print(f"   Поиск Groq: {c['name']} не упомянут в новостях, пропускаю")
-            continue
+            headline = corroborate_by_news(c["name"])
+            if not headline:
+                print(f"   Поиск Groq: {c['name']}: свежей новости про него не найдено, пропускаю")
+                continue
+            print(f"   Поиск Groq: {c['name']} подтверждён новостью: {headline[:110]}")
         c["change"] = "found"  # найден бесплатный доступ; «новизну» не утверждаем
         gem.append(c)
     if gem:
