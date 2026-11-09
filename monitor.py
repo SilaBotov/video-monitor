@@ -33,7 +33,7 @@ DRY_RUN = "--dry-run" in sys.argv[1:] or os.environ.get("DRY_RUN", "").strip().l
 MAX_SEEN = 1000
 # True: в отчёт попадают только карточки с измеримым бесплатным объёмом (кредиты, секунды, ролики).
 # False: достаточно подтверждённого бесплатного доступа — вернуть прежнее, более мягкое поведение.
-REQUIRE_FREE_VOLUME = True
+REQUIRE_FREE_VOLUME = False
 # False: сервисы, найденные только обычным веб-поиском (лендинги, каталоги, рейтинги), в пост не попадают.
 # Новостью считаются только материалы из Google News и новостного поиска DuckDuckGo. Поставь True, чтобы вернуть прежнее поведение.
 WEB_RESULTS_CAN_BE_NEWS = False
@@ -835,6 +835,7 @@ REPORT_PROMPT = """Составь текст отчёта ТОЛЬКО по да
 Утверждения о бесплатных кредитах, лимитах и отсутствии карты относи только к тем сервисам, у которых это есть в данных. Если данных о сервисе нет, не называй его и не пиши о нём в summary.
 Если у сервиса есть поле what_changed, в первом предложении абзаца опиши, что именно изменилось. Не используй оценочные слова («мощный», «полный набор функций», «революционный»).
 Не упоминай проверку условий и слова «на официальном сайте». Не пиши фраз вроде «не указано», «информация отсутствует», «детали не раскрыты»: если данных нет, просто ничего об этом не говори. Если у сервиса мало данных, опиши его одним коротким предложением. Не начинай абзац со слов «Название — новый сервис генерации видео»: сразу переходи к условиям и возможностям.
+Если у сервиса change=found, не пиши, что он «появился», «запущен» или «новый»: просто опиши его бесплатные условия. В summary перечисли, у каких сервисов есть бесплатный доступ или пробный период, не называя их новыми.
 Пиши по-русски. Верни СТРОГО один JSON-объект:
 {
   "summary": "2-3 предложения о том, что изменилось на рынке, без утверждений, которых нет в данных",
@@ -868,9 +869,9 @@ def esc(s: str) -> str:
 
 
 ACCESS_TAGS = {
-    "trial": {"new": "🆕 с пробным периодом", "updated": "🔄 с пробным периодом"},
-    "trial+free": {"new": "🆕 бесплатно + триал", "updated": "🔄 бесплатно + триал"},
-    "free": {"new": "🆕", "updated": "🔄"},
+    "trial": {"new": "🆕 с пробным периодом", "updated": "🔄 с пробным периодом", "found": "🆓 с пробным периодом"},
+    "trial+free": {"new": "🆕 бесплатно + триал", "updated": "🔄 бесплатно + триал", "found": "🆓 бесплатно + триал"},
+    "free": {"new": "🆕", "updated": "🔄", "found": "🆓"},
 }
 
 
@@ -1021,7 +1022,20 @@ def main() -> None:
     data["items"] = data.get("items") or []
     print("2.2 Поиск кандидатов встроенным поиском Groq...")
     have = {it.get("name", "").strip().lower() for it in data["items"]}
-    gem = [c for c in web_search_candidates(state["seen"]) if c["name"].strip().lower() not in have]
+    # Кандидат от поиска принимается, только если его название встречается в новостях первого этапа (Google News, DuckDuckGo News).
+    news_text = " ".join(
+        f"{r.get('title', '')} {r.get('snippet', '')}" for r in search_results if r.get("source") in ("google_news", "ddg_news")
+    ).lower()
+    gem = []
+    for c in web_search_candidates(state["seen"]):
+        low = c["name"].strip().lower()
+        if low in have:
+            continue
+        if low not in news_text:
+            print(f"   Поиск Groq: {c['name']} не упомянут в новостях, пропускаю")
+            continue
+        c["change"] = "found"  # найден бесплатный доступ; «новизну» не утверждаем
+        gem.append(c)
     if gem:
         data["has_news"] = True
         data["items"].extend(gem)
@@ -1044,6 +1058,9 @@ def main() -> None:
         return
     print("2.5 Проверка условий на сайтах сервисов...")
     verify_items(data["items"])
+    for it in data["items"]:
+        if it.get("change") == "found" and it.get("_verified"):
+            it["access_type"] = "trial" if str(it.get("quota_type", "")).lower() == "trial" else "free"
     for it in data["items"]:
         wc = str(it.get("what_changed", ""))
         if it.get("change") == "updated" and it.get("_verified") and re.search(r"кредит|credit", wc, re.IGNORECASE):
