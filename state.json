@@ -11,21 +11,6 @@
       "date": "2026-11-04"
     },
     {
-      "name": "Google Vids (Gemini Omni 1.1)",
-      "domain": "news.google.com",
-      "date": "2026-11-04"
-    },
-    {
-      "name": "Google NotebookLM",
-      "domain": "news.google.com",
-      "date": "2026-11-04"
-    },
-    {
-      "name": "Google NotebookLM",
-      "domain": "news.google.com",
-      "date": "2026-11-04"
-    },
-    {
       "name": "AIVideoFree",
       "domain": "markets.businessinsider.com",
       "date": "2026-11-05"
@@ -34,11 +19,6 @@
       "name": "Seedance 2.0",
       "domain": "news.google.com",
       "date": "2026-11-05"
-    },
-    {
-      "name": "MiniMax AI",
-      "domain": "minimax.io",
-      "date": "2026-11-06"
     },
     {
       "name": "FlatAI",
@@ -98,32 +78,21 @@
     {
       "name": "AIVideoFree",
       "domain": "aivideofree.com",
-      "date": "2026-11-06"
-    },
-    {
-      "name": "AIVideoFree",
-      "domain": "aivideofree.com",
-      "date": "2026-11-06"
-    },
-    {
-      "name": "VideoGen",
-      "domain": "videogen.io",
-      "date": "2026-11-06"
-    },
-    {
-      "name": "VideoGen",
-      "domain": "videogen.io",
-      "date": "2026-11-06"
-    },
-    {
-      "name": "AIVideoFree",
-      "domain": "aivideofree.com",
       "date": "2026-11-07"
     },
     {
       "name": "VideoGen",
       "domain": "videogen.io",
       "date": "2026-11-07"
+    },
+    {
+      "name": "Google Vids",
+      "domain": "workspace.google.com",
+      "date": "2026-11-10",
+      "sig": {
+        "nums": [],
+        "models": []
+      }
     }
   ]
 }
