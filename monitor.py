@@ -65,7 +65,8 @@ SYSTEM_PROMPT = """Ты — аналитик рынка бесплатных г�
 
 ИСТОЧНИКИ ДЛЯ РАЗРАБОТЧИКОВ (пометки ОБСУЖДЕНИЕ, РЕПОЗИТОРИЙ, СТАТЬЯ РАЗРАБОТЧИКА):
 - По ним можно создавать карточки с service_kind=api или open_source, если платформа или проект реально даёт бесплатную генерацию видео.
-- Сервисом считается платформа, которая предоставляет бесплатные модели (например, компания с бесплатным видео-API). Репозиторий-надстройка над чужим бесплатным API отдельным сервисом не является: сделай карточку на платформу-источник API (service_kind=api), а надстройку упомяни в notes. Если платформа из материалов не ясна, делай карточку на сам проект (service_kind=open_source).
+- Сервисом считается платформа, которая предоставляет бесплатные модели (например, компания с бесплатным видео-API). Репозиторий-надстройка над чужим бесплатным API отдельным сервисом не является. Если в тексте репозитория сказано «powered by X», «built on X», «на базе X», «free API от X» или нужен ключ API другой компании X, ОБЯЗАТЕЛЬНО сделай ОДНУ карточку на платформу X (service_kind=api, url — сайт платформы, если он назван, иначе пустая строка), а все надстройки над ней перечисли в notes. Несколько надстроек над одной платформой — это одна карточка, а не несколько. Если платформа из материалов не ясна, делай карточку на сам проект (service_kind=open_source).
+- Для api и open_source в free_limits пиши, что именно бесплатно, например «бесплатный доступ к видеомодели через API (заявление авторов)». Не оставляй «не указано», если материал называет доступ бесплатным.
 - Не называй проект бесплатным, если материал этого прямо не говорит. Заявления «без лимитов» в README и постах авторов считай заявлением самого проекта и добавь в notes: «заявление авторов, не проверено».
 - Платформа, запущенная давно, но ещё не попадавшая в список отправленных, считается новой для канала (change=new).
 
@@ -154,6 +155,14 @@ def is_relevant(title: str, snippet: str = "") -> bool:
 FREE_RE = re.compile(r"free|бесплат|open[\s-]?source|unlimited|no limits|без лимит|безлимит|открыт", re.IGNORECASE)
 
 
+DEV_VIDEO_RE = re.compile(r"\bvideos?\b|видео|text[\s-]to[\s-]video|\bsora\b|\bveo\b|\bkling\b|seedance", re.IGNORECASE)
+
+
+def is_relevant_dev(title: str, snippet: str = "") -> bool:
+    """Для источников разработчиков фильтр строже: должно быть слово video (иначе заходит весь мусор про агентов и редакторы)."""
+    return bool(DEV_VIDEO_RE.search(f"{title} {snippet}"))
+
+
 def as_list(v) -> list:
     """Приводит значение к списку строк и убирает «не указано»."""
     if v is None:
@@ -227,6 +236,8 @@ HN_QUERIES = [
     "free video generation API",
     "open source AI video generator",
     "free text to video",
+    "free multimodal API text image video",
+    "free video model API no limits",
 ]
 
 GH_QUERIES = [
@@ -241,20 +252,26 @@ DEVTO_TAGS = ("ai", "video", "opensource")
 
 def gh_headers() -> dict:
     h = {"Accept": "application/vnd.github+json", "User-Agent": "video-monitor"}
-    token = os.environ.get("GITHUB_TOKEN")
+    # Токен необязателен: без него скрипт работает, просто с меньшим лимитом запросов к поиску GitHub
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
         h["Authorization"] = f"Bearer {token}"
     return h
 
 
-def fetch_readme(full_name: str, max_chars: int = 600) -> str:
-    """Начало README репозитория без картинок и разметки."""
+def fetch_readme(full_name: str, branch: str = "main", max_chars: int = 1200) -> str:
+    """Начало README репозитория без картинок и разметки.
+    Берётся с raw.githubusercontent.com: этот адрес не входит в лимиты API, токен не нужен."""
     try:
-        h = gh_headers()
-        h["Accept"] = "application/vnd.github.raw+json"
-        r = requests.get(f"https://api.github.com/repos/{full_name}/readme", headers=h, timeout=15)
-        r.raise_for_status()
-        text = r.text
+        text = ""
+        for name in ("README.md", "readme.md", "README.MD"):
+            r = requests.get(f"https://raw.githubusercontent.com/{full_name}/{branch}/{name}",
+                             headers={"User-Agent": "video-monitor"}, timeout=15)
+            if r.status_code == 200 and r.text.strip():
+                text = r.text
+                break
+        if not text:
+            return ""
         text = re.sub(r"\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)", " ", text)  # бейджи со ссылками
         text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)                 # картинки
         text = re.sub(r"<[^>]+>", " ", text)                                # html-теги
@@ -282,7 +299,7 @@ def search_hn(seen_urls: set) -> list[dict]:
                 title = h.get("title") or ""
                 url = h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}"
                 body = clean_html(h.get("story_text") or "")
-                if not title or url in seen_urls or is_junk(title, body) or not is_relevant(title, body):
+                if not title or url in seen_urls or is_junk(title, body) or not is_relevant_dev(title, body):
                     continue
                 seen_urls.add(url)
                 out.append({"title": title, "snippet": body[:300], "url": url, "source": "hn"})
@@ -304,19 +321,23 @@ def search_github(seen_urls: set) -> list[dict]:
                 headers=gh_headers(),
                 timeout=15,
             )
+            if r.status_code in (403, 429):
+                print("   GitHub: лимит запросов исчерпан, остальные запросы к GitHub пропускаю "
+                      "(токен GITHUB_TOKEN в monitor.yml увеличивает лимит)")
+                break
             r.raise_for_status()
             for repo in r.json().get("items", []):
                 url = repo.get("html_url", "")
                 desc = repo.get("description") or ""
                 title = f"{repo.get('full_name', '')}: {desc}"[:150]
-                if not url or url in seen_urls or is_junk(title) or not is_relevant(title, desc):
+                if not url or url in seen_urls or is_junk(title) or not is_relevant_dev(title, desc):
                     continue
                 seen_urls.add(url)
                 snippet = (f"{desc} (звёзд: {repo.get('stargazers_count', 0)}, "
                            f"создан {str(repo.get('created_at', ''))[:10]}, обновлён {str(repo.get('pushed_at', ''))[:10]})")
                 item = {"title": title, "snippet": snippet, "url": url, "source": "github", "page_text": ""}
                 if readmes < 8:
-                    item["page_text"] = fetch_readme(repo.get("full_name", ""))
+                    item["page_text"] = fetch_readme(repo.get("full_name", ""), repo.get("default_branch") or "main")
                     readmes += 1
                 out.append(item)
             time.sleep(2)  # у поиска GitHub маленький лимит запросов в минуту
@@ -342,7 +363,7 @@ def search_devto(seen_urls: set) -> list[dict]:
                 desc = a.get("description", "") or ""
                 url = a.get("url", "")
                 text = f"{title} {desc}"
-                if not url or url in seen_urls or is_junk(title, desc) or not is_relevant(title, desc) or not FREE_RE.search(text):
+                if not url or url in seen_urls or is_junk(title, desc) or not is_relevant_dev(title, desc) or not FREE_RE.search(text):
                     continue
                 seen_urls.add(url)
                 out.append({"title": title, "snippet": desc[:300], "url": url, "source": "devto"})
@@ -532,7 +553,7 @@ def build_context(search_results: list[dict], budget: int = CONTEXT_BUDGET) -> s
             kind = SOURCE_LABELS.get(r.get("source"), "СПРАВОЧНАЯ СТРАНИЦА (не новость)")
             part = f"[{kind}] {r['title']}\nURL: {r['url']}\nСниппет: {str(r['snippet'])[:300]}"
             if r.get("page_text"):
-                part += f"\nТекст со страницы:\n{r['page_text'][:600]}"
+                part += f"\nТекст со страницы:\n{r['page_text'][:1000]}"
             if used + len(part) > budget:
                 return "\n\n---\n\n".join(f"{n}. {p}" for n, p in enumerate(parts, 1))
             parts.append(part)
@@ -778,7 +799,12 @@ def has_data(it: dict) -> bool:
     for k in ("free_limits", "quota_type"):
         if str(it.get(k, "")).strip().lower() not in ("", "не указано", "для видео не указано"):
             return True
-    return str(it.get("free_access", "")).strip().lower() == "да"
+    if str(it.get("free_access", "")).strip().lower() == "да":
+        return True
+    # API и открытые проекты: у них нет тарифов, достаточно, чтобы карточка называла доступ бесплатным
+    if str(it.get("service_kind", "web")).strip().lower() in ("api", "open_source"):
+        return bool(FREE_RE.search(f"{it.get('notes', '')} {it.get('free_limits', '')}"))
+    return False
 
 
 def mostly_latin(text: str) -> bool:
@@ -1019,14 +1045,23 @@ def main() -> None:
     if no_reason:
         print(f"   Пропущены обновления без описания изменения: {', '.join(no_reason)}")
         data["items"] = [it for it in data["items"] if not (it.get("change") == "updated" and not str(it.get("what_changed", "")).strip())]
-    data["items"] = data["items"][:6]
+    # не больше 2 открытых проектов за пост: надстроек над одним API бывает много
+    dev_count = 0
+    capped = []
+    for it in data["items"]:
+        if str(it.get("service_kind", "web")).strip().lower() == "open_source":
+            dev_count += 1
+            if dev_count > 2:
+                continue
+        capped.append(it)
+    data["items"] = capped[:6]
     if not data["items"]:
         print("Все найденные сервисы уже отправлялись ранее.")
         return
     print("2.5 Проверка условий на сайтах сервисов...")
     verify_items(data["items"])
 
-    seen_domains = {s["domain"] for s in state["seen"] if is_official_candidate(s["domain"])}
+    seen_domains = {s["domain"] for s in state["seen"] if s["domain"] and is_official_candidate(s["domain"])}
     data["items"] = [
         it for it in data["items"]
         if it.get("change") == "updated" or (
