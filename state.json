@@ -93,6 +93,16 @@
         "nums": [],
         "models": []
       }
+    },
+    {
+      "name": "Agnes Video Generator",
+      "domain": "github.com",
+      "date": "2026-11-11"
+    },
+    {
+      "name": "Agnes AI Video Suite (EchoSync)",
+      "domain": "github.com",
+      "date": "2026-11-11"
     }
   ]
 }
