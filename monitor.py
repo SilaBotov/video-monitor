@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Мониторинг бесплатных веб-генераторов видео -> Telegram.
+Мониторинг бесплатных генераторов видео (веб-сервисы, бесплатные API, открытые проекты) -> Telegram.
 Версия с Groq API (бесплатно, без карты, работает в РФ).
-Поиск: Google News RSS + DuckDuckGo News/Web + парсинг страниц -> анализ через Groq.
+Поиск: Google News RSS + DuckDuckGo News/Web + Hacker News + GitHub + dev.to -> анализ через Groq.
 """
 import json
 import os
@@ -10,7 +10,7 @@ import re
 import html
 import time
 import feedparser
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 
@@ -27,29 +27,31 @@ from openai import OpenAI
 STATE_FILE = Path(__file__).with_name("state.json")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-# --dry-run: полный прогон, но без отправки в Telegram и без записи в state.json.
-DRY_RUN = "--dry-run" in sys.argv[1:] or os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
-# Сколько последних записей истории хранить: state.json не должен расти бесконечно.
-MAX_SEEN = 1000
-# True: в отчёт попадают только карточки с измеримым бесплатным объёмом (кредиты, секунды, ролики).
-# False: достаточно подтверждённого бесплатного доступа — вернуть прежнее, более мягкое поведение.
-REQUIRE_FREE_VOLUME = False
 # False: сервисы, найденные только обычным веб-поиском (лендинги, каталоги, рейтинги), в пост не попадают.
-# Новостью считаются только материалы из Google News и новостного поиска DuckDuckGo. Поставь True, чтобы вернуть прежнее поведение.
+# Новостью считаются только материалы из Google News, новостного поиска DuckDuckGo и источников для разработчиков
+# (Hacker News, GitHub, dev.to). Поставь True, чтобы вернуть прежнее поведение.
 WEB_RESULTS_CAN_BE_NEWS = False
-# Поиск кандидатов встроенным веб-поиском Groq (browser_search у моделей gpt-oss): названия и сайты новых сервисов.
-# Условия по-прежнему проверяются только по официальным сайтам. При ошибке шаг пропускается.
+# Искать бесплатные API и открытые проекты (Hacker News, GitHub, dev.to). False отключает эти источники.
+DEV_SOURCES_ENABLED = True
+# За сколько дней смотреть источники для разработчиков и «расширенные» запросы Google News
+DEV_DAYS = 30
+# Сколько символов результатов поиска отправляется в модель. Если Groq отвечает 413/429, уменьши до 8000-9000.
+CONTEXT_BUDGET = 11000
 
-SYSTEM_PROMPT = """Ты — аналитик рынка веб-генераторов видео на основе ИИ.
+SYSTEM_PROMPT = """Ты — аналитик рынка бесплатных генераторов видео на основе ИИ.
 Задача: по предоставленным данным (результаты поиска и тексты страниц) составить отчёт о НОВЫХ платформах и ЗАМЕТНЫХ изменениях условий. Пиши на русском языке.
 
 КРИТЕРИИ ОТБОРА (обязательные):
-1. Работает напрямую в браузере на сайте. Инструменты только через Discord или Telegram-ботов исключаются.
+1. Подходят три вида сервисов (поле service_kind):
+   - web: работает напрямую в браузере на сайте сервиса;
+   - api: платформа открыла бесплатный API с видеомоделью (нужен ключ, работает через код или готовые обёртки);
+   - open_source: открытый проект, который запускается на своём компьютере или сервере и использует бесплатные модели (локально или через чужой бесплатный API).
+   Инструменты только через Discord или Telegram-ботов исключаются.
 2. Есть бесплатный тариф или триал: стартовые кредиты при регистрации, ежедневно возобновляемые квоты или безлимитные демо-режимы. Включай сервис при ЛЮБОМ бесплатном доступе, даже ограниченном. Привязку банковской карты не считай препятствием: если источник говорит, требуется ли она, укажи это в notes.
 3. Это реальный запуск или изменение лимитов/условий, а не обзор, рейтинг или реклама.
 
 ЧТО ФИКСИРОВАТЬ (только если это прямо указано в источниках):
-- Объём бесплатных ресурсов: секунды, генерации или токены.
+- Объём бесплатных ресурсов: секунды, генерации или токены; для API — лимит запросов в минуту, если он назван.
 - Тип квоты: daily (обновление каждые 24 часа), monthly (ежемесячное обновление), trial (разовый приветственный пакет), rolling (скользящие циклы, например 5-часовые в экосистеме Google).
 - Форматы: вертикальный 9:16 (Reels, Shorts, TikTok) и горизонтальный 16:9 (приоритет платформам с 9:16).
 - Бесплатное разрешение: 480p, 720p, HD, Full HD.
@@ -61,15 +63,20 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 СПЕЦИАЛЬНЫЙ ТРИГГЕР — Google NotebookLM:
 Сообщай о NotebookLM ТОЛЬКО если появился полноценный художественный видеогенератор по свободному текстовому промпту с нуля, независимый от загруженных документов (в Studio Panel или в коде сервиса). Видеообзоры (Video Overviews) по заметкам и документам, регистрация товарных знаков, переименования и прочие обновления — НЕ триггер.
 
+ИСТОЧНИКИ ДЛЯ РАЗРАБОТЧИКОВ (пометки ОБСУЖДЕНИЕ, РЕПОЗИТОРИЙ, СТАТЬЯ РАЗРАБОТЧИКА):
+- По ним можно создавать карточки с service_kind=api или open_source, если платформа или проект реально даёт бесплатную генерацию видео.
+- Сервисом считается платформа, которая предоставляет бесплатные модели (например, компания с бесплатным видео-API). Репозиторий-надстройка над чужим бесплатным API отдельным сервисом не является: сделай карточку на платформу-источник API (service_kind=api), а надстройку упомяни в notes. Если платформа из материалов не ясна, делай карточку на сам проект (service_kind=open_source).
+- Не называй проект бесплатным, если материал этого прямо не говорит. Заявления «без лимитов» в README и постах авторов считай заявлением самого проекта и добавь в notes: «заявление авторов, не проверено».
+- Платформа, запущенная давно, но ещё не попадавшая в список отправленных, считается новой для канала (change=new).
+
 ПРАВИЛА ДОСТОВЕРНОСТИ:
 - Используй только факты, явно указанные в источниках. Если параметр не указан, ставь «не указано» в полях карточки и не домысливай; в текстах (summary, notes, details) недостающую информацию просто не упоминай.
 - В текстах никогда не ссылайся на «статью», «источник», «публикацию» или «материал»: не пиши «в статье отмечается», «по данным источника», «в источнике нет информации». Излагай факты напрямую, от своего лица. Не делай выводов о намерениях компаний и о будущей доступности.
 - Не указывай страну происхождения сервиса или компании, если источник прямо её не называет.
 - В summary не утверждай про бесплатные тарифы, если для сервиса в items лимиты не указаны.
-- Обзоры, рейтинги и подборки («лучшие», «топ-N», «протестировали», сравнения) НЕ являются новостью о запуске. Не включай сервис только потому, что он упомянут в такой подборке. Включай сервис, только если материал сообщает именно о его запуске, ребрендинге, новой версии или изменении условий. Значение change=new ставь только для реального запуска сервиса.
+- Обзоры, рейтинги и подборки («лучшие», «топ-N», «протестировали», сравнения) НЕ являются новостью о запуске. Не включай сервис только потому, что он упомянут в такой подборке. Включай сервис, только если материал сообщает именно о его запуске, ребрендинге, новой версии или изменении условий. Значение change=new ставь только для реального запуска сервиса (или, для источников разработчиков, когда сервис ещё не отправлялся).
 - Источники с пометкой «СПРАВОЧНАЯ СТРАНИЦА» (лендинги сервисов, каталоги, рейтинги) не подтверждают, что сервис новый: по ним нельзя создавать карточки и ставить change=new.
 - Если в материале указана только платная цена (например, оплата за секунду видео или подписка) и бесплатный доступ не упомянут, не включай сервис. Выпуск новой модели без бесплатного доступа новостью для этого канала не является.
-- Денежные суммы и «кредиты на сумму $N» не считаются бесплатными лимитами. Если в материале нет прямых слов о бесплатном доступе для обычных пользователей (бесплатный тариф, пробный период, кредиты при регистрации), не включай сервис.
 - change=updated ставь только если изменились бесплатные условия, лимиты, режимы или видеомодели сервиса. Интеграция моделей для изображений или текста, обновления интерфейса, рекламные анонсы и общие новости — не повод.
 - Все текстовые поля (free_limits, notes, details) пиши по-русски, даже если источник на английском.
 - Не пиши «без ограничений» и «безлимит», если источник прямо не говорит об отсутствии лимитов на количество генераций.
@@ -81,13 +88,14 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 Ответ верни СТРОГО одним JSON-объектом без пояснений и без markdown-ограждений:
 {
   "has_news": true,
-  "headline": "Свежие изменения в условиях и лимитах веб-платформ",
+  "headline": "Свежие изменения в условиях бесплатных видеогенераторов",
   "summary": "2-3 предложения о том, что изменилось на рынке",
   "items": [
     {
       "name": "название сервиса",
       "url": "официальная ссылка или ссылка на источник",
       "official_url": "адрес официального сайта сервиса, только если он явно указан в источниках, иначе пустая строка",
+      "service_kind": "web|api|open_source",
       "free_limits": "объём бесплатных ресурсов (секунды/генерации/токены)",
       "quota_type": "daily|monthly|trial|rolling|не указано",
       "resolution": "480p|720p|HD|Full HD|не указано",
@@ -107,35 +115,13 @@ SYSTEM_PROMPT = """Ты — аналитик рынка веб-генерато�
 }"""
 
 
-def dedupe_seen(entries: list) -> list:
-    """Убирает повторы: одна запись на пару (название, домен), позиция — по последнему появлению."""
-    merged: dict[tuple[str, str], dict] = {}
-    for e in entries or []:
-        if not isinstance(e, dict) or not str(e.get("name", "")).strip():
-            continue
-        key = (str(e["name"]).strip().lower(), str(e.get("domain", "")).strip().lower())
-        merged.pop(key, None)  # переставляем запись в конец, чтобы порядок отражал свежесть
-        merged[key] = e
-    return list(merged.values())
-
-
 def load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {"seen": []}
-    try:
-        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
-        print(f"   state.json не читается ({e}): начинаю с пустой истории")
-        return {"seen": []}
-    if not isinstance(state, dict):
-        return {"seen": []}
-    seen = state.get("seen")
-    state["seen"] = dedupe_seen(seen if isinstance(seen, list) else [])[-MAX_SEEN:]
-    return state
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return {"seen": []}
 
 
 def save_state(state: dict) -> None:
-    state["seen"] = dedupe_seen(state.get("seen", []))[-MAX_SEEN:]
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -163,6 +149,9 @@ VIDEO_RE = re.compile(
 def is_relevant(title: str, snippet: str = "") -> bool:
     """Оставляем только материалы, где вообще речь о видео или генерации."""
     return bool(VIDEO_RE.search(f"{title} {snippet}"))
+
+
+FREE_RE = re.compile(r"free|бесплат|open[\s-]?source|unlimited|no limits|без лимит|безлимит|открыт", re.IGNORECASE)
 
 
 def as_list(v) -> list:
@@ -231,14 +220,156 @@ def ddg_call(fn, q: str, timelimit: str) -> list:
         return list(fn(q, max_results=5))
 
 
+# ---------- Источники для разработчиков: Hacker News, GitHub, dev.to ----------
+
+HN_QUERIES = [
+    "free AI video generator",
+    "free video generation API",
+    "open source AI video generator",
+    "free text to video",
+]
+
+GH_QUERIES = [
+    "topic:free-video-generator",
+    "topic:ai-video-generator",
+    "free ai video generator in:name,description",
+    "free text-to-video api in:name,description",
+]
+
+DEVTO_TAGS = ("ai", "video", "opensource")
+
+
+def gh_headers() -> dict:
+    h = {"Accept": "application/vnd.github+json", "User-Agent": "video-monitor"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+def fetch_readme(full_name: str, max_chars: int = 600) -> str:
+    """Начало README репозитория без картинок и разметки."""
+    try:
+        h = gh_headers()
+        h["Accept"] = "application/vnd.github.raw+json"
+        r = requests.get(f"https://api.github.com/repos/{full_name}/readme", headers=h, timeout=15)
+        r.raise_for_status()
+        text = r.text
+        text = re.sub(r"\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)", " ", text)  # бейджи со ссылками
+        text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)                 # картинки
+        text = re.sub(r"<[^>]+>", " ", text)                                # html-теги
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)               # ссылки -> текст
+        text = re.sub(r"[#*`>|]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+    except Exception as e:
+        print(f"   README {full_name} не прочитан: {e}")
+        return ""
+
+
+def search_hn(seen_urls: set) -> list[dict]:
+    out = []
+    since = int(time.time()) - DEV_DAYS * 86400
+    for q in HN_QUERIES:
+        try:
+            r = requests.get(
+                "https://hn.algolia.com/api/v1/search_by_date",
+                params={"query": q, "tags": "story", "numericFilters": f"created_at_i>{since}", "hitsPerPage": 8},
+                timeout=15,
+            )
+            r.raise_for_status()
+            for h in r.json().get("hits", []):
+                title = h.get("title") or ""
+                url = h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}"
+                body = clean_html(h.get("story_text") or "")
+                if not title or url in seen_urls or is_junk(title, body) or not is_relevant(title, body):
+                    continue
+                seen_urls.add(url)
+                out.append({"title": title, "snippet": body[:300], "url": url, "source": "hn"})
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Ошибка Hacker News '{q}': {e}")
+    return out
+
+
+def search_github(seen_urls: set) -> list[dict]:
+    out = []
+    since = (datetime.now() - timedelta(days=DEV_DAYS)).strftime("%Y-%m-%d")
+    readmes = 0
+    for q in GH_QUERIES:
+        try:
+            r = requests.get(
+                "https://api.github.com/search/repositories",
+                params={"q": f"{q} pushed:>{since} stars:>=3", "sort": "updated", "order": "desc", "per_page": 5},
+                headers=gh_headers(),
+                timeout=15,
+            )
+            r.raise_for_status()
+            for repo in r.json().get("items", []):
+                url = repo.get("html_url", "")
+                desc = repo.get("description") or ""
+                title = f"{repo.get('full_name', '')}: {desc}"[:150]
+                if not url or url in seen_urls or is_junk(title) or not is_relevant(title, desc):
+                    continue
+                seen_urls.add(url)
+                snippet = (f"{desc} (звёзд: {repo.get('stargazers_count', 0)}, "
+                           f"создан {str(repo.get('created_at', ''))[:10]}, обновлён {str(repo.get('pushed_at', ''))[:10]})")
+                item = {"title": title, "snippet": snippet, "url": url, "source": "github", "page_text": ""}
+                if readmes < 8:
+                    item["page_text"] = fetch_readme(repo.get("full_name", ""))
+                    readmes += 1
+                out.append(item)
+            time.sleep(2)  # у поиска GitHub маленький лимит запросов в минуту
+        except Exception as e:
+            print(f"Ошибка GitHub '{q}': {e}")
+    return out
+
+
+def search_devto(seen_urls: set) -> list[dict]:
+    out = []
+    for tag in DEVTO_TAGS:
+        try:
+            r = requests.get(
+                "https://dev.to/api/articles",
+                params={"tag": tag, "top": DEV_DAYS, "per_page": 30},
+                headers={"User-Agent": "video-monitor"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            added = 0
+            for a in r.json():
+                title = a.get("title", "")
+                desc = a.get("description", "") or ""
+                url = a.get("url", "")
+                text = f"{title} {desc}"
+                if not url or url in seen_urls or is_junk(title, desc) or not is_relevant(title, desc) or not FREE_RE.search(text):
+                    continue
+                seen_urls.add(url)
+                out.append({"title": title, "snippet": desc[:300], "url": url, "source": "devto"})
+                added += 1
+                if added >= 6:
+                    break
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Ошибка dev.to '{tag}': {e}")
+    return out
+
+
+def search_dev_sources(seen_urls: set) -> list[dict]:
+    results = search_hn(seen_urls) + search_github(seen_urls) + search_devto(seen_urls)
+    print(f"   Из источников разработчиков (HN, GitHub, dev.to): {len(results)}")
+    return results
+
+
 def search_and_parse() -> list[dict]:
-    """Ищет в Google News RSS, DuckDuckGo News и Web, парсит страницы результатов."""
+    """Ищет в Google News RSS, DuckDuckGo News и Web, источниках разработчиков."""
     year = datetime.now().year
     results = []
     seen_urls = set()
 
     # 1. Google News RSS (Самые свежие пресс-релизы и новости, обновляется в реальном времени)
-    news_queries = [
+    # Каждый запрос: (текст, окно). Для API и открытых проектов окно шире: такие запуски живут в новостях дольше.
+    news_queries = [(q, "7d") for q in [
         "AI video generator free browser",
         "Google NotebookLM update video",
         "AI video generator Russia available",
@@ -249,19 +380,15 @@ def search_and_parse() -> list[dict]:
         "AI video generator rebrand",
         "AI video generator launches free credits sign up",
         "AI video studio launch free trial",
-        "unveils AI video generation platform",
-        "launches AI video generator free credits",
-        "new Seedance Kling Veo version free",
-        "ByteDance AI video platform launch",
-    ]
-    for q in news_queries:
+    ]] + [(q, f"{DEV_DAYS}d") for q in [
+        "free AI video generation API unlimited",
+        "open-source AI video generator free",
+        "free multimodal API video model launch",
+    ]]
+    for q, win in news_queries:
         try:
-            url = f"https://news.google.com/rss/search?q={requests.utils.quote(q + ' when:7d')}&hl=ru&gl=RU&ceid=RU:ru"
+            url = f"https://news.google.com/rss/search?q={requests.utils.quote(q + ' when:' + win)}&hl=ru&gl=RU&ceid=RU:ru"
             feed = feedparser.parse(url)
-            if not feed.entries:
-                time.sleep(3)
-                feed = feedparser.parse(url)
-            print(f"   Google News '{q[:45]}': записей {len(feed.entries)} (HTTP {getattr(feed, 'status', '?')}, ошибка разбора: {bool(getattr(feed, 'bozo', 0))})")
             for entry in feed.entries[:5]:  # Берем топ-5 по каждому запросу
                 link = entry.get("link", "")
                 title = entry.get("title", "")
@@ -278,7 +405,7 @@ def search_and_parse() -> list[dict]:
                     "url": real_link,
                     "source": "google_news",
                 })
-            time.sleep(2.5)
+            time.sleep(0.5)
         except Exception as e:
             print(f"Ошибка Google News RSS '{q}': {e}")
 
@@ -288,6 +415,8 @@ def search_and_parse() -> list[dict]:
         f"Google NotebookLM video generation update {year}",
         f"AI video generator available Russia VPN {year}",
         f"AI video generator rebrand launch free credits {year}",
+        f"free AI video generation API unlimited {year}",
+        f"open-source AI video generator free {year}",
     ]
     for q in ddg_news_queries:
         try:
@@ -335,183 +464,17 @@ def search_and_parse() -> list[dict]:
         except Exception as e:
             print(f"Ошибка DuckDuckGo Web '{q}': {e}")
 
+    # 4. Hacker News, GitHub, dev.to: бесплатные API и открытые проекты
+    if DEV_SOURCES_ENABLED:
+        results += search_dev_sources(seen_urls)
+
     print(f"   Всего найдено уникальных ссылок: {len(results)}")
 
-    # Тексты статей не читаем: условия проверяет второй этап по официальным сайтам сервисов.
+    # Тексты статей не читаем (кроме README репозиториев): условия проверяет второй этап по официальным сайтам.
     for r in results:
-        r["page_text"] = ""
+        r.setdefault("page_text", "")
 
     return results
-
-
-# ---------- Площадки запусков: Hacker News и Product Hunt (не зависят от Google News) ----------
-
-LAUNCH_BOARD_RE = re.compile(r"^\s*(?:Show|Launch)\s+HN:\s*(.+)$", re.IGNORECASE)
-
-
-def _board_item(name: str, url: str, why: str):
-    name = name.strip(" -–—:|\"'")
-    if not name or len(name) > 40 or len(name.split()) > 4:
-        return None
-    if url and not (url.startswith("http") and is_official_candidate(domain(url))):
-        url = ""
-    return {
-        "name": name, "url": url, "official_url": url, "change": "new", "access_type": "free",
-        "notes": "", "modes": [], "models": [], "_gemini": True, "_why": why,
-    }
-
-
-def hn_candidates() -> list[dict]:
-    """Show HN / Launch HN про ИИ-видео за последние 7 дней (бесплатный поиск Algolia по Hacker News)."""
-    since = int(time.time()) - 7 * 86400
-    out = []
-    for q in ("AI video generator", "text to video", "video generation"):
-        try:
-            r = requests.get(
-                "https://hn.algolia.com/api/v1/search_by_date",
-                params={"query": q, "tags": "story", "numericFilters": f"created_at_i>{since}", "hitsPerPage": 20},
-                timeout=20,
-            )
-            r.raise_for_status()
-            hits = r.json().get("hits", [])
-        except Exception as e:
-            print(f"   Hacker News '{q}': не удалось ({' '.join(str(e).split())[:120]})")
-            continue
-        print(f"   Hacker News '{q}': записей {len(hits)}")
-        for h in hits:
-            title = h.get("title") or ""
-            m = LAUNCH_BOARD_RE.match(title)
-            if not m or is_junk(title) or not is_relevant(title):
-                continue
-            head = re.split(r"\s[–—-]\s|:\s|\s\|\s|\(", m.group(1), maxsplit=1)[0]
-            item = _board_item(head, h.get("url") or "", f"Hacker News: {title[:90]}")
-            if item:
-                out.append(item)
-        time.sleep(1)
-    return out
-
-
-def producthunt_candidates() -> list[dict]:
-    """Свежие запуски Product Hunt (RSS), где речь об ИИ и видео."""
-    try:
-        feed = feedparser.parse("https://www.producthunt.com/feed")
-    except Exception as e:
-        print(f"   Product Hunt: не удалось ({' '.join(str(e).split())[:120]})")
-        return []
-    print(f"   Product Hunt: записей {len(feed.entries)}")
-    out = []
-    for e in feed.entries:
-        title = e.get("title", "")
-        text = f"{title} {clean_html(e.get('summary', ''))}"
-        if is_junk(text) or not re.search(r"video|видео", text, re.IGNORECASE) or not re.search(r"\bAI\b|ИИ|нейро", text):
-            continue
-        head = re.split(r"\s[–—-]\s|:\s", title, maxsplit=1)[0]
-        item = _board_item(head, "", f"Product Hunt: {title[:90]}")
-        if item:
-            out.append(item)
-    return out
-
-
-LAUNCH_RE = re.compile(
-    r"launch|unveil|introduc|\badds?\b|\badded\b|rolls? out|rebrand|free tier|free plan|free credits|now free|бесплатн|запуст|запуск|представ|добав|открыл",
-    re.IGNORECASE,
-)
-ROUNDUP_RE = re.compile(
-    r"\bbest\b|\btop\b|\bvs\b|review|how to|guide|лучш|топ-?\d|обзор|сравнен|как создать|руководство",
-    re.IGNORECASE,
-)
-
-
-def corroborate_by_news(name: str) -> str:
-    """Ищет свежую новость именно про этот сервис (название в заголовке + слова о запуске или бесплатных условиях).
-    Возвращает заголовок или пустую строку."""
-    low = name.strip().lower()
-    titles = []
-    try:
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(name + ' free AI video when:14d')}&hl=en-US&gl=US&ceid=US:en"
-        feed = feedparser.parse(url)
-        titles += [e.get("title", "") for e in feed.entries[:10]]
-    except Exception as e:
-        print(f"   Новости про {name}: Google News не ответил ({e})")
-    time.sleep(2)
-    try:
-        with DDGS() as ddgs:
-            hits = ddg_call(ddgs.news, f"{name} free AI video", "m")
-        titles += [h.get("title", "") for h in hits]
-    except Exception as e:
-        print(f"   Новости про {name}: DuckDuckGo не ответил ({e})")
-    time.sleep(1)
-    for t in titles:
-        if low in t.lower() and LAUNCH_RE.search(t) and not ROUNDUP_RE.search(t):
-            return t
-    return ""
-
-
-SEARCH_PROMPT = """Today is {today}. Search the web. List AI video generation web platforms that work directly in a browser and that LAUNCHED, REBRANDED or CHANGED THEIR FREE PLAN / FREE CREDITS during the last 7 days.
-Rules:
-- Only services with a free plan, free trial or free sign-up credits. Skip paid-only services, Discord or Telegram bots, rankings, reviews and roundups.
-- official_url must be the service's OWN website (not a news article, catalog or social network). If you are not sure about the address, leave it empty.
-- Do not invent services. If you found nothing reliable, return an empty list.
-- Do not describe limits or prices: only the name, the official site and a short reason.
-Return ONLY a JSON object, no markdown:
-{"services": [{"name": "...", "official_url": "https://...", "why": "one short sentence: launch, rebrand or free plan change"}]}
-Return at most 8 services."""
-
-
-def web_search_candidates(seen: list[dict]) -> list[dict]:
-    """Просит Groq (gpt-oss с встроенным веб-поиском) назвать новые сервисы. Берём только названия и адреса сайтов."""
-    client = OpenAI(base_url=GROQ_BASE_URL, api_key=os.environ["GROQ_API_KEY"])
-    prompt = SEARCH_PROMPT.replace("{today}", datetime.now().strftime("%Y-%m-%d"))
-    text = ""
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[{"type": "browser_search"}],
-                tool_choice="required",
-                temperature=0.1,
-                max_tokens=3000,
-                extra_body={"reasoning_effort": "low"},
-            )
-            text = resp.choices[0].message.content or ""
-            break
-        except Exception as e:
-            msg = " ".join(str(e).split())[:300]
-            if attempt < 2 and ("429" in msg or "Parsing failed" in msg):
-                wait = 40 if "429" in msg else 5
-                print(f"   Поиск Groq: сбой ({msg[:80]}), попытка {attempt + 2} из 3 через {wait} с...")
-                time.sleep(wait)
-                continue
-            print(f"   Поиск Groq: ошибка: {msg}")
-            return []
-    try:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        services = json.loads(match.group(0)).get("services", [])
-    except Exception as e:
-        print(f"   Поиск Groq: не удалось разобрать ответ ({e}): {' '.join(text[:300].split())}")
-        return []
-    seen_names = {str(s.get("name", "")).strip().lower() for s in seen if isinstance(s, dict)}
-    out = []
-    for sv in services if isinstance(services, list) else []:
-        if not isinstance(sv, dict):
-            continue
-        name = str(sv.get("name", "")).strip()
-        url = str(sv.get("official_url", "")).strip()
-        if not name:
-            continue
-        if name.lower() in seen_names:
-            print(f"   Поиск Groq: {name} уже отправлялся, пропускаю")
-            continue
-        if url and not (url.startswith("http") and is_official_candidate(domain(url))):
-            url = ""
-        out.append({
-            "name": name, "url": url, "official_url": url, "change": "new", "access_type": "free",
-            "notes": "", "modes": [], "models": [], "_gemini": True,
-        })
-        print(f"   Поиск Groq: кандидат {name} | {url or 'адрес не указан'} | {str(sv.get('why', ''))[:100]}")
-    print(f"   Поиск Groq: кандидатов {len(out)}")
-    return out
 
 
 def call_groq(system: str, user: str, max_tokens: int = 4000) -> dict:
@@ -544,18 +507,44 @@ def call_groq(system: str, user: str, max_tokens: int = 4000) -> dict:
     return json.loads(match.group(0))
 
 
+SOURCE_LABELS = {
+    "google_news": "НОВОСТЬ",
+    "ddg_news": "НОВОСТЬ",
+    "hn": "ОБСУЖДЕНИЕ (Hacker News)",
+    "github": "РЕПОЗИТОРИЙ (GitHub)",
+    "devto": "СТАТЬЯ РАЗРАБОТЧИКА (dev.to)",
+}
+CONTEXT_ORDER = ("github", "hn", "devto", "google_news", "ddg_news", "ddg_web")
+
+
+def build_context(search_results: list[dict], budget: int = CONTEXT_BUDGET) -> str:
+    """Собирает контекст для модели по кругу из разных источников, чтобы ни один не вытеснил остальные."""
+    groups: dict[str, list[dict]] = {}
+    for r in search_results:
+        groups.setdefault(r.get("source", ""), []).append(r)
+    order = [g for g in CONTEXT_ORDER if g in groups] + [g for g in groups if g not in CONTEXT_ORDER]
+    parts, used, i = [], 0, 0
+    while any(i < len(groups[g]) for g in order):
+        for g in order:
+            if i >= len(groups[g]):
+                continue
+            r = groups[g][i]
+            kind = SOURCE_LABELS.get(r.get("source"), "СПРАВОЧНАЯ СТРАНИЦА (не новость)")
+            part = f"[{kind}] {r['title']}\nURL: {r['url']}\nСниппет: {str(r['snippet'])[:300]}"
+            if r.get("page_text"):
+                part += f"\nТекст со страницы:\n{r['page_text'][:600]}"
+            if used + len(part) > budget:
+                return "\n\n---\n\n".join(f"{n}. {p}" for n, p in enumerate(parts, 1))
+            parts.append(part)
+            used += len(part)
+        i += 1
+    return "\n\n---\n\n".join(f"{n}. {p}" for n, p in enumerate(parts, 1))
+
+
 def ask_groq(search_results: list[dict], seen: list[dict]) -> dict:
     today = datetime.now().strftime("%d.%m.%Y")
     seen_text = "\n".join(f"- {s['name']} ({s['domain']}), {s['date']}" for s in seen[-80:]) or "(пусто)"
-
-    context_parts = []
-    for i, r in enumerate(search_results, 1):
-        kind = "НОВОСТЬ" if r.get("source") in ("google_news", "ddg_news") else "СПРАВОЧНАЯ СТРАНИЦА (не новость)"
-        part = f"{i}. [{kind}] {r['title']}\nURL: {r['url']}\nСниппет: {str(r['snippet'])[:300]}"
-        if r.get("page_text"):
-            part += f"\nТекст со страницы:\n{r['page_text'][:900]}"
-        context_parts.append(part)
-    context = "\n\n---\n\n".join(context_parts)
+    context = build_context(search_results)
 
     prompt = f"""Сегодня {today}.
 
@@ -563,7 +552,7 @@ def ask_groq(search_results: list[dict], seen: list[dict]) -> dict:
 {seen_text}
 
 Данные для анализа:
-{context[:9000]}
+{context}
 
 Проанализируй данные и верни СТРОГО JSON согласно инструкции в системном промпте."""
 
@@ -577,14 +566,16 @@ NOT_OFFICIAL = (
     "businessinsider.com", "techcrunch.com", "theverge.com", "medium.com", "msn.com", "wikipedia.org",
     "twitter.com", "x.com", "facebook.com", "linkedin.com", "t.me", "tiktok.com", "github.com",
     "producthunt.com", "aiservicesindex.com", "aitoolnet.com", "toolify.ai", "futurepedia.io", "theresanaiforthat.com", "aitools.fyi", "toolradar.com", "feedough.com", "felloai.com", "pexo.ai", "tenchat.ru", "dzen.ru", "yandex.ru", "bing.com",
+    "dev.to", "ycombinator.com", "hn.svelte.dev", "alternativeto.net", "freellm.net", "free-llm.com", "skillselion.com",
+    "glama.ai", "juejin.cn", "docker.com", "npmjs.com", "pypi.org", "huggingface.co", "skool.com", "kocpc.com.tw",
 )
 
 VERIFY_PROMPT = """Ты проверяешь условия бесплатного доступа AI-видеогенератора ТОЛЬКО по текстам с его собственного сайта.
 Используй исключительно факты из предоставленных текстов. Если параметр не указан, пиши «не указано». Ничего не домысливай и не указывай страну происхождения.
-Бесплатным считай только то, что прямо названо бесплатным: бесплатный тариф (Free), пробный период, кредиты при регистрации. Платные тарифы с кредитами в месяц, цены и суммы в долларах бесплатным доступом НЕ являются. Если на сайте видны только платные тарифы, ставь free_access «нет».
+Для API-платформ в free_limits укажи также лимит запросов в минуту, если он назван.
 Верни СТРОГО один JSON-объект:
 {
-  "official_site": "да, если сайт принадлежит самому сервису или компании-разработчику; нет, если это сторонний сайт, фан-сайт, перепродавец чужих моделей, каталог или в тексте есть оговорка вроде «не аффилирован», «unofficial», «independent». Ставь «нет», если сайт — агрегатор или витрина, которая предлагает чужие видеомодели (Veo, Kling, Sora, Seedance и т.п.) и не имеет собственной модели",
+  "official_site": "да, если сайт принадлежит самому сервису или компании-разработчику; нет, если это сторонний сайт, фан-сайт, перепродавец чужих моделей, каталог или в тексте есть оговорка вроде «не аффилирован», «unofficial», «independent»",
   "free_access": "да|нет|не указано",
   "free_limits": "бесплатные лимиты именно на ГЕНЕРАЦИЮ ВИДЕО: кредиты, секунды, генерации (кратко, по-русски). Если на сайте указаны лимиты только для изображений или текста, напиши «для видео не указано (для изображений: ...)»",
   "quota_type": "daily|monthly|trial|rolling|не указано",
@@ -614,6 +605,7 @@ KNOWN_SITES = [
     (r"dreamina|capcut", "https://dreamina.capcut.com"),
     (r"\bpika\b", "https://pika.art"),
     (r"\bluma\b", "https://lumalabs.ai"),
+    (r"\bagnes\b", "https://agnes-ai.com"),
 ]
 
 
@@ -630,11 +622,6 @@ def find_site_by_search(item: dict) -> str:
     words = re.findall(r"[A-Za-z0-9]+", name)
     token = words[0].lower() if words else ""
     hint = item.get("official_url") or ""
-    if item.get("_gemini") and hint.startswith("http") and is_official_candidate(domain(hint)):
-        p = urlparse(hint)
-        path = "/".join(seg for seg in p.path.split("/") if seg)
-        path = path.split("/")[0]
-        return f"{p.scheme}://{p.netloc}" + (f"/{path}" if path else "")
     if hint.startswith("http") and is_official_candidate(domain(hint)) and (not token or token in domain(hint).replace("-", "")):
         p = urlparse(hint)
         return f"{p.scheme}://{p.netloc}"
@@ -739,55 +726,37 @@ def verify_items(items: list[dict]) -> None:
     for it in items:
         name = it.get("name", "")
         old_notes = it.get("notes", "")
+        if str(it.get("service_kind", "web")).strip().lower() == "open_source":
+            # у открытого проекта нет сайта с тарифами: данные берутся из README на первом этапе
+            print(f"   {name}: открытый проект, проверка по сайту пропущена")
+            continue
         notes = []
         verified = False
-        reject = ""
         try:
             site = find_official_site(it)
             if not site:
                 print(f"   {name}: официальный сайт не найден")
-                reject = "официальный сайт не найден"
             else:
                 text = fetch_site_texts(site)
                 print(f"   {name}: сайт {site}, прочитано {len(text)} символов")
                 if len(text) < 300:
                     print(f"   {name}: мало текста (возможно, страница грузится скриптами)")
                     it["url"] = site
-                    reject = "сайт не отдал текст (возможно, нужен браузер)"
                 else:
                     data = call_groq(VERIFY_PROMPT, f"Сервис: {name}\nСайт: {site}\n\n{text[:7000]}", 1500)
                     time.sleep(3)
                     if str(data.get("official_site", "да")).strip().lower().startswith("нет"):
                         print(f"   {name}: {site} похож на неофициальный сайт, данные с него не используются")
-                        reject = "сайт не официальный (агрегатор, каталог или перепродажа)"
                     else:
                         it["url"] = site
                         merge_site_data(it, data, notes)
                         verified = True
         except Exception as e:
             print(f"   Проверка '{name}' не удалась: {e}")
-            reject = "ошибка при проверке сайта"
         if not verified and old_notes:
             notes = [old_notes] + notes
         # если сайт проверен, заметка первого этапа могла противоречить данным сайта, поэтому берём только данные сайта
         it["notes"] = " ".join(n.strip() for n in notes if n)
-        # флаг для has_data: без подтверждения на официальном сайте карточку не публикуем
-        it["_verified"] = verified
-        if reject:
-            it["_reject"] = reject
-        else:
-            it.pop("_reject", None)
-
-
-def rejection_reason(it: dict) -> str:
-    """Короткая причина, по которой карточка не попала в отчёт."""
-    if not it.get("_verified"):
-        return it.get("_reject") or "официальный сайт не подтверждён"
-    if str(it.get("free_access", "")).strip().lower() == "нет":
-        return "на сайте нет бесплатного доступа"
-    if REQUIRE_FREE_VOLUME and not has_volume(it):
-        return "бесплатный доступ есть, но объём не указан (нет цифр)"
-    return "нет подтверждённых данных"
 
 
 ALLOWED_MODES = {"image-to-video", "start & end frame", "липсинк", "нативный звук", "consistent characters", "text-to-video"}
@@ -804,93 +773,8 @@ def dedupe_models(models: list) -> list:
     return [m for m in out if not any(o.lower().startswith(m.lower() + " ") for o in out)]
 
 
-# ---------- Защита от мусорных карточек: деньги, «безлимит», текстовые модели, ложные обновления ----------
-
-# Суммы в деньгах не считаются бесплатными лимитами — их нельзя публиковать (см. системный промпт).
-MONEY_RE = re.compile(r"(?:\$|€|₽)\s?\d|\d[\d\s.,]*\s?(?:\$|€|₽|долл|usd|eur|руб)", re.IGNORECASE)
-# «Без ограничений» и «безлимит» разрешены, только если источник прямо об этом говорит; как правило это домысел.
-UNLIMITED_RE = re.compile(r"без\s+ограничен|безлимит|неограничен", re.IGNORECASE)
-# Текстовые модели не должны попадать в список видеомоделей.
-TEXT_MODEL_RE = re.compile(r"^\s*(gpt|chatgpt|claude|llama|mistral|deepseek|grok)\b", re.IGNORECASE)
-HAS_DIGIT_RE = re.compile(r"\d")
-NUMBER_WORD_RE = re.compile(
-    r"\b(один|одна|одно|одну|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)\b",
-    re.IGNORECASE,
-)
-
-
-def scrub_claims(text: str) -> str:
-    """Убирает суммы в деньгах и обещания безлимита: публиковать их нельзя."""
-    text = re.sub(r"\([^)]*(?:\$|€|₽)[^)]*\)", "", str(text or ""))
-    clauses = re.split(r"(?<=[.;])\s+", text)
-    kept = [c for c in clauses if c.strip() and not MONEY_RE.search(c) and not UNLIMITED_RE.search(c)]
-    cleaned = re.sub(r"\s{2,}", " ", " ".join(kept)).strip()
-    return cleaned.strip(" ,;.")
-
-
-def sanitize_items(items: list[dict]) -> None:
-    """Чистит карточки до публикации: деньги, безлимит, текстовые модели."""
-    for it in items:
-        for key in ("free_limits", "what_changed", "notes"):
-            if it.get(key):
-                it[key] = scrub_claims(it[key])
-        if "models" in it:
-            it["models"] = [m for m in as_list(it.get("models")) if not TEXT_MODEL_RE.search(m)]
-
-
-def has_volume(it: dict) -> bool:
-    """Есть ли у бесплатного доступа измеримый объём: кредиты, секунды, ролики, генерации."""
-    lim = str(it.get("free_limits", "")).strip()
-    if not lim or "не указан" in lim.lower():
-        return False
-    return bool(HAS_DIGIT_RE.search(lim) or NUMBER_WORD_RE.search(lim) or UNLIMITED_RE.search(lim))
-
-
-def update_signature(it: dict) -> dict:
-    """Отпечаток условий сервиса: числа из лимитов + видеомодели.
-
-    Нужен, чтобы отличить реальное изменение условий от пересказа того же самого.
-    """
-    nums = sorted(set(re.findall(r"\d+(?:[.,]\d+)?", str(it.get("free_limits", "")))))
-    models = sorted({m.strip().lower() for m in as_list(it.get("models"))})
-    return {"nums": nums, "models": models}
-
-
-def filter_unconfirmed_updates(items: list[dict], seen: list[dict]) -> tuple[list[dict], list[str]]:
-    """change=updated пропускаем, только если условия отличаются от прошлой отправки."""
-    prev_by_name = {
-        str(s.get("name", "")).strip().lower(): s
-        for s in seen
-        if isinstance(s, dict) and str(s.get("name", "")).strip()
-    }
-    kept, dropped = [], []
-    for it in items:
-        if it.get("change") != "updated":
-            kept.append(it)
-            continue
-        prev = prev_by_name.get(str(it.get("name", "")).strip().lower())
-        if prev is None:
-            it["change"] = "new"  # сервис ещё не отправлялся — это не обновление
-            kept.append(it)
-            continue
-        if not prev.get("sig"):
-            kept.append(it)  # история без отпечатка: даём один шанс и запоминаем условия
-            continue
-        if prev["sig"] == update_signature(it):
-            dropped.append(it.get("name", "?"))
-            continue
-        kept.append(it)
-    return kept, dropped
-
-
 def has_data(it: dict) -> bool:
-    """Публикуем только то, что подтверждено на официальном сайте и имеет измеримый объём."""
-    if not it.get("_verified"):
-        return False
-    if str(it.get("free_access", "")).strip().lower() == "нет":
-        return False
-    if REQUIRE_FREE_VOLUME:
-        return has_volume(it)
+    """Есть ли подтверждение бесплатного доступа: лимиты, тип квоты или явное «да» с сайта."""
     for k in ("free_limits", "quota_type"):
         if str(it.get(k, "")).strip().lower() not in ("", "не указано", "для видео не указано"):
             return True
@@ -938,8 +822,8 @@ REPORT_PROMPT = """Составь текст отчёта ТОЛЬКО по да
 Не добавляй фактов, которых там нет. Не указывай страну происхождения сервисов и компаний. Параметры со значением «не указано» не упоминай вообще. Никогда не ссылайся на «статью», «источник» или «публикацию»: не пиши «в статье отмечается», «по данным источника». Излагай факты напрямую.
 Утверждения о бесплатных кредитах, лимитах и отсутствии карты относи только к тем сервисам, у которых это есть в данных. Если данных о сервисе нет, не называй его и не пиши о нём в summary.
 Если у сервиса есть поле what_changed, в первом предложении абзаца опиши, что именно изменилось. Не используй оценочные слова («мощный», «полный набор функций», «революционный»).
+Если service_kind равен api, одной фразой скажи, что нужен API-ключ и генерация идёт через код или готовые обёртки. Если service_kind равен open_source, одной фразой скажи, что проект запускается на своём компьютере или сервере.
 Не упоминай проверку условий и слова «на официальном сайте». Не пиши фраз вроде «не указано», «информация отсутствует», «детали не раскрыты»: если данных нет, просто ничего об этом не говори. Если у сервиса мало данных, опиши его одним коротким предложением. Не начинай абзац со слов «Название — новый сервис генерации видео»: сразу переходи к условиям и возможностям.
-Если у сервиса change=found, не пиши, что он «появился», «запущен» или «новый»: просто опиши его бесплатные условия. В summary перечисли, у каких сервисов есть бесплатный доступ или пробный период, не называя их новыми.
 Пиши по-русски. Верни СТРОГО один JSON-объект:
 {
   "summary": "2-3 предложения о том, что изменилось на рынке, без утверждений, которых нет в данных",
@@ -952,7 +836,7 @@ def rewrite_report(data: dict) -> None:
     try:
         slim = []
         for it in data.get("items", []):
-            d = {k: v for k, v in it.items() if k not in ("notes", "official_url", "url", "access_type") and not k.startswith("_")}
+            d = {k: v for k, v in it.items() if k not in ("notes", "official_url", "url", "access_type")}
             d = {k: v for k, v in d.items() if v not in ("не указано", "", [], None)}
             notes = it.get("notes", "").strip()
             if notes:
@@ -973,9 +857,14 @@ def esc(s: str) -> str:
 
 
 ACCESS_TAGS = {
-    "trial": {"new": "🆕 с пробным периодом", "updated": "🔄 с пробным периодом", "found": "🆓 с пробным периодом"},
-    "trial+free": {"new": "🆕 бесплатно + триал", "updated": "🔄 бесплатно + триал", "found": "🆓 бесплатно + триал"},
-    "free": {"new": "🆕", "updated": "🔄", "found": "🆓"},
+    "trial": {"new": "🆕 с пробным периодом", "updated": "🔄 с пробным периодом"},
+    "trial+free": {"new": "🆕 бесплатно + триал", "updated": "🔄 бесплатно + триал"},
+    "free": {"new": "🆕", "updated": "🔄"},
+}
+
+KIND_LINES = {
+    "api": "🔌 Бесплатный API: нужен ключ, генерация через код или готовые обёртки",
+    "open_source": "🧩 Открытый проект: запускается на своём компьютере",
 }
 
 
@@ -1011,7 +900,7 @@ def drop_unknown(text: str) -> str:
 
 
 def format_message(data: dict) -> str:
-    lines = [f"<b>{esc(data.get('headline', 'Свежие изменения в условиях и лимитах веб-платформ'))}</b>", ""]
+    lines = [f"<b>{esc(data.get('headline', 'Свежие изменения в условиях бесплатных видеогенераторов'))}</b>", ""]
     if data.get("summary"):
         lines += [esc(drop_unknown(clean_src(data["summary"]))), ""]
 
@@ -1025,6 +914,9 @@ def format_message(data: dict) -> str:
         title = f'<a href="{html.escape(url, quote=True)}">{name}</a>' if url else name
 
         lines.append(f"{tag} — <b>{title}</b>")
+        kind_line = KIND_LINES.get(str(it.get("service_kind", "web")).strip().lower())
+        if kind_line:
+            lines.append(kind_line)
         if it.get("change") == "updated" and str(it.get("what_changed", "")).strip():
             lines.append(f"📌 Изменилось: {esc(clean_src(it['what_changed']).strip())}")
         if str(it.get("free_limits", "")).strip().lower() not in ("", "не указано", "для видео не указано"):
@@ -1093,12 +985,6 @@ def send_telegram(text: str) -> None:
 
 def main() -> None:
     print("Запуск мониторинга...")
-    if not os.environ.get("GROQ_API_KEY"):
-        sys.exit("Не задан GROQ_API_KEY: добавь его в Secrets репозитория (Settings → Secrets and variables → Actions).")
-    if not DRY_RUN and not (os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")):
-        sys.exit("Не заданы TELEGRAM_BOT_TOKEN и/или TELEGRAM_CHAT_ID: добавь их в Secrets репозитория.")
-    if DRY_RUN:
-        print("   Режим --dry-run: сообщение будет только напечатано, state.json не изменится.")
     state = load_state()
 
     print("1. Поиск и парсинг страниц...")
@@ -1120,50 +1006,7 @@ def main() -> None:
             dropped = [it.get("name", "?") for it in data["items"] if it.get("url") in web_urls]
             print(f"   Отсеяны сервисы, найденные только справочными страницами: {', '.join(dropped)}")
         data["items"] = kept
-    sanitize_items(data.get("items", []))
-    if not data.get("has_news"):
-        data["items"] = []
-    data["items"] = data.get("items") or []
-    print("2.2 Поиск кандидатов встроенным поиском Groq...")
-    have = {it.get("name", "").strip().lower() for it in data["items"]}
-    # Кандидат от поиска принимается, только если про него есть свежая новость: в результатах первого этапа или в отдельном поиске по его названию.
-    news_text = " ".join(
-        f"{r.get('title', '')} {r.get('snippet', '')}" for r in search_results if r.get("source") in ("google_news", "ddg_news")
-    ).lower()
-    gem = []
-    for c in web_search_candidates(state["seen"]):
-        low = c["name"].strip().lower()
-        if low in have:
-            continue
-        if low not in news_text:
-            headline = corroborate_by_news(c["name"])
-            if not headline:
-                print(f"   Поиск Groq: {c['name']}: свежей новости про него не найдено, пропускаю")
-                continue
-            print(f"   Поиск Groq: {c['name']} подтверждён новостью: {headline[:110]}")
-        c["change"] = "found"  # найден бесплатный доступ; «новизну» не утверждаем
-        gem.append(c)
-    if gem:
-        data["has_news"] = True
-        data["items"].extend(gem)
-    print("2.3 Площадки запусков (Hacker News, Product Hunt)...")
-    taken = {it.get("name", "").strip().lower() for it in data["items"]} | {
-        str(x.get("name", "")).strip().lower() for x in state["seen"] if isinstance(x, dict)
-    }
-    boards, picked = [], set()
-    for c in hn_candidates() + producthunt_candidates():
-        low = c["name"].strip().lower()
-        if low in taken or low in picked:
-            continue
-        picked.add(low)
-        boards.append(c)
-    boards = boards[:4]
-    for c in boards:
-        print(f"   Площадки: кандидат {c['name']} | {c['url'] or 'адрес не указан'} | {c['_why']}")
-    if boards:
-        data["has_news"] = True
-        data["items"].extend(boards)
-    if not data["items"]:
+    if not data.get("has_news") or not data.get("items"):
         print("Новостей, соответствующих критериям, не найдено.")
         return
 
@@ -1176,26 +1019,12 @@ def main() -> None:
     if no_reason:
         print(f"   Пропущены обновления без описания изменения: {', '.join(no_reason)}")
         data["items"] = [it for it in data["items"] if not (it.get("change") == "updated" and not str(it.get("what_changed", "")).strip())]
-    data["items"] = data["items"][:8]
+    data["items"] = data["items"][:6]
     if not data["items"]:
-        print("Не осталось карточек для публикации.")
+        print("Все найденные сервисы уже отправлялись ранее.")
         return
     print("2.5 Проверка условий на сайтах сервисов...")
     verify_items(data["items"])
-    for it in data["items"]:
-        if it.get("change") == "found" and it.get("_verified"):
-            it["access_type"] = "trial" if str(it.get("quota_type", "")).lower() == "trial" else "free"
-    for it in data["items"]:
-        wc = str(it.get("what_changed", ""))
-        if it.get("change") == "updated" and it.get("_verified") and re.search(r"кредит|credit", wc, re.IGNORECASE):
-            norm = lambda t: {re.sub(r"[\s.,]", "", n) for n in re.findall(r"\d[\d\s.,]*\d|\d", str(t))}
-            if norm(wc) and not norm(wc) <= norm(it.get("free_limits", "")):
-                print(f"   {it.get('name', '?')}: числа про кредиты в описании изменения не подтверждены сайтом, описание отброшено")
-                it["what_changed"] = ""
-    data["items"] = [it for it in data["items"] if not (it.get("change") == "updated" and not str(it.get("what_changed", "")).strip())]
-    if not data["items"]:
-        print("После проверки на сайтах не осталось подтверждённых обновлений.")
-        return
 
     seen_domains = {s["domain"] for s in state["seen"] if is_official_candidate(s["domain"])}
     data["items"] = [
@@ -1206,19 +1035,14 @@ def main() -> None:
         )
     ]
 
-    data["items"], unconfirmed = filter_unconfirmed_updates(data["items"], state["seen"])
-    if unconfirmed:
-        print(f"   Пропущены повторные «обновления» без изменений в лимитах и моделях: {', '.join(unconfirmed)}")
     if not data["items"]:
         print("Все найденные сервисы уже отправлялись ранее.")
         return
 
     translate_items(data["items"])
-    empty = [(it.get("name", "?"), rejection_reason(it)) for it in data["items"] if not has_data(it)]
+    empty = [it.get("name", "?") for it in data["items"] if not has_data(it)]
     if empty:
-        print("   Пропущены карточки:")
-        for name, why in empty:
-            print(f"     - {name}: {why}")
+        print(f"   Пропущены сервисы без данных об условиях: {', '.join(empty)}")
         data["items"] = [it for it in data["items"] if has_data(it)]
     if not data["items"]:
         print("Нет сервисов с подтверждёнными данными для публикации.")
@@ -1227,14 +1051,7 @@ def main() -> None:
     rewrite_report(data)
 
     print("3. Отправка в Telegram...")
-    message = format_message(data)
-    if DRY_RUN:
-        print("\n---------- ЧЕРНОВИК СООБЩЕНИЯ (не отправлено) ----------\n")
-        print(message)
-        print("\n--------------------- КОНЕЦ ЧЕРНОВИКА ---------------------")
-        print("Dry-run завершён: Telegram и state.json не тронуты.")
-        return
-    send_telegram(message)
+    send_telegram(format_message(data))
 
     today = datetime.now().strftime("%Y-%m-%d")
     for it in data["items"]:
@@ -1242,7 +1059,6 @@ def main() -> None:
             "name": it.get("name", ""),
             "domain": domain(it.get("url", "")),
             "date": today,
-            "sig": update_signature(it),
         })
     save_state(state)
     print(f"Успешно отправлено позиций: {len(data['items'])}")
